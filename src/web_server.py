@@ -3599,6 +3599,7 @@ def settings():
             'STORYGRAPH_ENABLED',
             'TELEGRAM_ENABLED',
             'SUGGESTIONS_ENABLED',
+            'SUGGESTIONS_AUTO_MATCH_ENABLED',
             'ABS_ONLY_SEARCH_IN_ABS_LIBRARY_ID',
             'REPROCESS_ON_CLEAR_IF_NO_ALIGNMENT',
             'INSTANT_SYNC_ENABLED',
@@ -6879,6 +6880,74 @@ def _start_suggestions_scan_job(cached_suggestions_by_abs=None, cached_no_match_
     return job_id
 
 
+def _auto_match_threshold():
+    try:
+        value = float(os.environ.get('SUGGESTIONS_AUTO_MATCH_THRESHOLD', '100'))
+    except (TypeError, ValueError):
+        value = 100.0
+    return max(0.0, min(value, 100.0))
+
+
+def _auto_match_suggestions(results, user_id):
+    if not env_truthy('SUGGESTIONS_AUTO_MATCH_ENABLED'):
+        return results
+    if not isinstance(results, dict):
+        return results
+    suggestions = results.get('suggestions') or []
+    if not suggestions:
+        return results
+
+    threshold = _auto_match_threshold()
+    mapping_service = container.book_mapping_service()
+    cache_by_abs = results.get('cache_by_abs') or {}
+    remaining = []
+    matched = 0
+
+    for suggestion in suggestions:
+        matches = suggestion.get('matches') or []
+        top = max(matches, key=lambda m: m.get('score') or 0.0) if matches else None
+        score = float(top.get('score') or 0.0) if top else 0.0
+        if not top or score < threshold:
+            remaining.append(suggestion)
+            continue
+        try:
+            saved = mapping_service.create_audio_mapping_from_match(
+                audio_source=suggestion.get('audio_source') or 'ABS',
+                audio_source_id=suggestion.get('audio_source_id') or suggestion.get('abs_id') or '',
+                audio_title=suggestion.get('audio_title') or suggestion.get('abs_title') or '',
+                ebook_filename=top.get('ebook_filename') or '',
+                audio_cover_url=suggestion.get('audio_cover_url'),
+                audio_duration=suggestion.get('audio_duration') or suggestion.get('duration'),
+                audio_provider_book_id=suggestion.get('audio_provider_book_id'),
+                audio_provider_file_id=suggestion.get('audio_provider_file_id'),
+                ebook_source=top.get('source'),
+                ebook_source_id=str(top.get('source_id')) if top.get('source_id') is not None else None,
+                user_id=user_id,
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Auto-match failed for '{suggestion.get('abs_title')}': {e}")
+            remaining.append(suggestion)
+            continue
+        if not saved:
+            remaining.append(suggestion)
+            continue
+        matched += 1
+        cache_by_abs.pop(suggestion.get('abs_id'), None)
+        logger.info(
+            f"🔗 Auto-matched '{suggestion.get('abs_title')}' to "
+            f"'{top.get('display_name') or top.get('ebook_filename')}' at {score:.1f}%"
+        )
+
+    if matched:
+        results['suggestions'] = remaining
+        results['cache_by_abs'] = cache_by_abs
+        stats = results.get('stats') or {}
+        stats['auto_matched'] = matched
+        results['stats'] = stats
+        logger.info(f"🔗 Auto-match created {matched} mapping(s) at or above {threshold:.1f}%")
+    return results
+
+
 def _run_suggestions_scan_job(job_id, cached_suggestions_by_abs=None, cached_no_match_abs_ids=None):
     def update_progress(progress_payload):
         with SUGGESTIONS_SCAN_JOBS_LOCK:
@@ -6892,6 +6961,7 @@ def _run_suggestions_scan_job(job_id, cached_suggestions_by_abs=None, cached_no_
             cached_no_match_abs_ids=cached_no_match_abs_ids,
             progress_callback=update_progress,
         )
+        results = _auto_match_suggestions(results, get_current_user_id())
         _save_persisted_suggestions_cache({
             "scan_cache_by_abs": results.get('cache_by_abs', {}) if isinstance(results, dict) else {},
             "scan_cache_no_match_abs_ids": results.get('no_match_abs_ids', []) if isinstance(results, dict) else [],

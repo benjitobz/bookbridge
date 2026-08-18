@@ -1559,6 +1559,30 @@
                         </p>
                     </div>
                     <div class="checkbox-wrapper full-width">
+                        <input type="checkbox" id="suggestions_auto_match" name="SUGGESTIONS_AUTO_MATCH_ENABLED"
+                            onchange="updateAutoMatchFields()"
+                            {% if get_bool('SUGGESTIONS_AUTO_MATCH_ENABLED') %}checked{% endif %}>
+                        <label for="suggestions_auto_match">Auto-match suggestions at or above a score</label>
+                        <small>When a scan finds a candidate scoring at or above the threshold, link that book
+                            automatically. Suggestions scoring below the threshold are left on the Suggestions page
+                            for you to review.</small>
+                    </div>
+                    <div class="form-group{% if not get_bool('SUGGESTIONS_AUTO_MATCH_ENABLED') %} hidden{% endif %}"
+                        id="auto_match_threshold_group">
+                        <label>Auto-Match Threshold (%)</label>
+                        <input type="number" min="1" max="100" step="0.5" id="suggestions_auto_match_threshold"
+                            name="SUGGESTIONS_AUTO_MATCH_THRESHOLD"
+                            value="{{ get_val('SUGGESTIONS_AUTO_MATCH_THRESHOLD') or '100' }}"
+                            oninput="updateAutoMatchFields()">
+                        <small>100 links only exact matches — an identifier agreement or an identical title and
+                            author.</small>
+                        <div id="auto_match_warning" class="help-text"
+                            style="display:none;background:rgba(255,152,0,.10);border:1px solid rgba(255,152,0,.35);border-radius:8px;padding:10px 12px;margin-top:8px;">
+                            ⚠️ Below 95% the top candidate is often a different book — a sequel, another edition, or
+                            another title in the same series. A wrong link syncs your position into the wrong book.
+                        </div>
+                    </div>
+                    <div class="checkbox-wrapper full-width">
                         <input type="checkbox" id="kosync_auto_map" name="KOSYNC_AUTO_MAP_ON_AGREEMENT"
                             {% if get_bool('KOSYNC_AUTO_MAP_ON_AGREEMENT') %}checked{% endif %}>
                         <label for="kosync_auto_map">Auto-map on exact agreement</label>
@@ -3084,6 +3108,19 @@
         });
 
         function initDynamicForms() {
+            function updateAutoMatchFields() {
+                const toggle = document.getElementById('suggestions_auto_match');
+                const group = document.getElementById('auto_match_threshold_group');
+                const field = document.getElementById('suggestions_auto_match_threshold');
+                const warning = document.getElementById('auto_match_warning');
+                if (!toggle || !group || !field || !warning) return;
+                group.classList.toggle('hidden', !toggle.checked);
+                const value = parseFloat(field.value);
+                warning.style.display = (toggle.checked && !isNaN(value) && value < 95) ? 'block' : 'none';
+            }
+            window.updateAutoMatchFields = updateAutoMatchFields;
+            updateAutoMatchFields();
+
             // 1. ABS Library ID Toggle
             const absCheckbox = document.getElementById('abs_only_lib');
             const absServerInput = document.querySelector('input[name="ABS_SERVER"]');
