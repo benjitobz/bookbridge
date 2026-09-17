@@ -3374,6 +3374,63 @@ class BookloreClient:
 
         return mapping
 
+    def _get_json_or_none(self, endpoint: str, context: str):
+        response = self._make_request("GET", endpoint)
+        if response is None or response.status_code != 200:
+            logger.debug("Grimmory: Could not read %s (status=%s)", context, getattr(response, "status_code", None))
+            return None
+        return self._parse_json_response(response, context)
+
+    def get_shelf_book_ids(self, shelf_names: list[str]) -> Optional[dict[str, set[str]]]:
+        """Return shelf name -> ids of the books on it, for the named shelves.
+
+        Names match regular shelves case-insensitively, then magic shelves for
+        any name no regular shelf has. A name that matches no shelf is left out
+        of the result. Returns None when a shelf list or a shelf's books could
+        not be read, so an unreadable shelf is never mistaken for an empty one.
+        """
+        wanted = {name.strip().casefold() for name in shelf_names if name.strip()}
+        payload = self._get_json_or_none("/api/v1/shelves", "Grimmory shelves list")
+        if payload is None:
+            return None
+        members: dict[str, set[str]] = {}
+        for shelf in self._normalize_shelves_payload(payload):
+            shelf_name = str(shelf.get("name") or "").strip()
+            if shelf_name.casefold() not in wanted:
+                continue
+            data = self._get_json_or_none(
+                f"/api/v1/shelves/{shelf.get('id')}/books", f"Grimmory shelf {shelf_name} books"
+            )
+            if data is None:
+                return None
+            books = data.get("content", data.get("books", [])) if isinstance(data, dict) else data
+            members.setdefault(shelf_name, set()).update(
+                str(book["id"]) for book in books if isinstance(book, dict) and book.get("id") is not None
+            )
+
+        missing = wanted - {shelf_name.casefold() for shelf_name in members}
+        if not missing:
+            return members
+        payload = self._get_json_or_none("/api/magic-shelves", "Grimmory magic shelves list")
+        if payload is None:
+            return None
+        magic_shelves = [
+            shelf for shelf in self._normalize_shelves_payload(payload)
+            if str(shelf.get("name") or "").strip().casefold() in missing
+        ]
+        if not magic_shelves:
+            return members
+        data = self._get_json_or_none("/api/v1/books", "Grimmory all books for filter")
+        if data is None:
+            return None
+        all_books = data.get("content", data.get("books", [])) if isinstance(data, dict) else data
+        for shelf in magic_shelves:
+            members.setdefault(str(shelf["name"]).strip(), set()).update(
+                str(book["id"]) for book in self._evaluate_magic_shelf(shelf, all_books)
+                if isinstance(book, dict) and book.get("id") is not None
+            )
+        return members
+
     def _normalize_shelves_payload(self, payload):
         if isinstance(payload, list):
             return [item for item in payload if isinstance(item, dict)]
