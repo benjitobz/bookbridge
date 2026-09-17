@@ -89,11 +89,11 @@ _BOOKLORE_SHELF_MAPPING_TTL_SECONDS = 86400
 _hardcover_list_mapping_cache: dict = {}
 _hardcover_list_mapping_cache_lock = threading.Lock()
 _HARDCOVER_LIST_MAPPING_TTL_SECONDS = 86400
-# Shelf membership decides which books a device downloads, so it follows shelf
-# edits much faster than the cosmetic collection mapping above.
+# Shelf membership decides which books a device downloads, so a shelf edit must
+# reach the next device sync; the short TTL only absorbs simultaneous wake-ups.
 _booklore_shelf_filter_cache: dict = {}
 _booklore_shelf_filter_cache_lock = threading.Lock()
-_BOOKLORE_SHELF_FILTER_TTL_SECONDS = 900
+_BOOKLORE_SHELF_FILTER_TTL_SECONDS = 60
 
 # KoSync PUT debounce state
 _kosync_debounce: dict = {}  # {(abs_id, user_id): {'last_event': float, 'title': str, 'synced': bool, 'user_id', 'abs_id'}}
