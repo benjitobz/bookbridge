@@ -1,18 +1,20 @@
 name: Fork - Deploy Image
 
-# The `deploy` branch is upstream `main` plus this fork's patches. Whenever the
-# fork's `main` moves (GitHub "Sync fork"), `main` is merged into `deploy` and the
-# result is published as ghcr.io/benjitobz/bookbridge:deploy. A push to `deploy`
-# itself is built as-is.
+# `main` is a pure mirror of upstream main; `deploy` (the default branch) is
+# upstream main plus this fork's patches. On a schedule, on a manual run and on
+# every push to `deploy`, upstream main is fetched, mirrored to `main`, merged
+# into `deploy`, and the result is published as ghcr.io/benjitobz/bookbridge:deploy
+# when anything changed. A push to `deploy` itself is always built.
 #
-# Merging `main` can touch files under .github/workflows/, which the built-in
-# GITHUB_TOKEN may not push. Add a PAT with `repo` + `workflow` scope as the
-# SYNC_TOKEN secret to cover that case; without it the merge push fails only
-# when upstream changed a workflow file.
+# Pushing merged workflow files needs more than the built-in GITHUB_TOKEN allows.
+# Add a PAT with `repo` + `workflow` scope as the SYNC_TOKEN secret; without it
+# the run fails only when upstream changed a file under .github/workflows/.
 
 on:
   push:
-    branches: [main, deploy]
+    branches: [deploy]
+  schedule:
+    - cron: '17 */6 * * *'
   workflow_dispatch:
     inputs:
       force_build:
@@ -31,7 +33,7 @@ env:
 
 jobs:
   sync:
-    name: Merge main into deploy
+    name: Merge upstream into deploy
     if: github.repository == 'benjitobz/bookbridge'
     runs-on: ubuntu-latest
     permissions:
@@ -49,12 +51,11 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.SYNC_TOKEN || github.token }}
 
-      - name: Merge and decide
+      - name: Sync, merge and decide
         id: sync
         env:
           FORCE_BUILD: ${{ inputs.force_build }}
           EVENT_NAME: ${{ github.event_name }}
-          EVENT_REF: ${{ github.ref }}
           HEAD_AUTHOR: ${{ github.event.head_commit.author.name }}
         run: |
           set -eu
@@ -63,14 +64,18 @@ jobs:
           git remote add upstream "$UPSTREAM_URL"
           git fetch --quiet --tags upstream main
 
+          # main: hard mirror of upstream, never edited on this fork
+          git push --quiet --force origin upstream/main:refs/heads/main \
+            || echo "::warning::Could not mirror upstream main to origin/main (a SYNC_TOKEN secret is needed when upstream changed a workflow file)."
+
           before="$(git rev-parse HEAD)"
-          if ! git merge --no-edit origin/main; then
+          if ! git merge --no-edit upstream/main; then
             {
               echo "### Merge failed"
               echo
-              echo "Merging the fork's \`main\` into \`deploy\` hit a conflict. Resolve it locally:"
+              echo "Merging upstream main into \`deploy\` hit a conflict. Resolve it locally:"
               echo '```'
-              echo "git checkout deploy && git merge main"
+              echo "git fetch upstream && git checkout deploy && git merge upstream/main"
               echo "# fix conflicts, then: git push origin deploy"
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
@@ -85,12 +90,12 @@ jobs:
             fi
           fi
 
-          human_push_to_deploy=false
-          if [ "$EVENT_NAME" = push ] && [ "$EVENT_REF" = refs/heads/deploy ] && [ "$HEAD_AUTHOR" != 'github-actions[bot]' ]; then
-            human_push_to_deploy=true
+          human_push=false
+          if [ "$EVENT_NAME" = push ] && [ "$HEAD_AUTHOR" != 'github-actions[bot]' ]; then
+            human_push=true
           fi
           build=false
-          if [ "$before" != "$after" ] || [ "$FORCE_BUILD" = true ] || [ "$human_push_to_deploy" = true ]; then
+          if [ "$before" != "$after" ] || [ "$FORCE_BUILD" = true ] || [ "$human_push" = true ]; then
             build=true
           fi
 
@@ -105,7 +110,7 @@ jobs:
           {
             echo "### deploy"
             echo
-            echo "| Merged main | Build | Commit | Version |"
+            echo "| Upstream merged | Build | Commit | Version |"
             echo "| --- | --- | --- | --- |"
             echo "| $([ "$before" != "$after" ] && echo yes || echo no) | $build | \`$short\` | \`${base#v}+deploy.$short\` |"
           } >> "$GITHUB_STEP_SUMMARY"
