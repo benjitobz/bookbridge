@@ -1757,6 +1757,28 @@
                             another title in the same series. A wrong link syncs your position into the wrong book.
                         </div>
                     </div>
+                    <div class="form-group">
+                        <label>Scheduled scan interval (minutes)</label>
+                        <input type="number" min="0" step="1" name="SUGGESTIONS_AUTO_SCAN_MINUTES"
+                            value="{{ get_val('SUGGESTIONS_AUTO_SCAN_MINUTES') or '0' }}">
+                        <small>0 turns scheduled scans off. A scheduled scan behaves like pressing Scan on the
+                            Suggestions page (cached results reused, auto-match applied) and runs as the primary
+                            admin.</small>
+                    </div>
+                    <div class="form-group">
+                        <label>Weekly full refresh</label>
+                        <div style="display:flex;gap:10px;align-items:center;">
+                            <select name="SUGGESTIONS_FULL_REFRESH_DAY">
+                                {% for day in ['off','monday','tuesday','wednesday','thursday','friday','saturday','sunday'] %}
+                                <option value="{{ day }}" {% if (get_val('SUGGESTIONS_FULL_REFRESH_DAY') or 'off')|lower == day %}selected{% endif %}>{{ day|capitalize }}</option>
+                                {% endfor %}
+                            </select>
+                            <input type="time" name="SUGGESTIONS_FULL_REFRESH_TIME"
+                                value="{{ get_val('SUGGESTIONS_FULL_REFRESH_TIME') or '04:00' }}">
+                        </div>
+                        <small>Once a week, clear the scan cache and rescan the whole unmatched library from
+                            scratch, the same as Full Refresh on the Suggestions page.</small>
+                    </div>
                     <div class="checkbox-wrapper full-width">
                         <input type="checkbox" id="kosync_auto_map" name="KOSYNC_AUTO_MAP_ON_AGREEMENT"
                             {% if get_bool('KOSYNC_AUTO_MAP_ON_AGREEMENT') %}checked{% endif %}>

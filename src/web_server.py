@@ -1821,6 +1821,7 @@ def sync_daemon():
         schedule.every(1).minutes.do(manager.check_pending_jobs)
         schedule.every(1).minutes.do(manager.flush_reading_sessions_for_all_users)
         schedule.every(1).hours.do(_run_diagnostics_send)
+        schedule.every(1).minutes.do(_suggestions_auto_scan_tick)
 
         logger.info(f"🔄 Sync daemon started (period: {SYNC_PERIOD_MINS} minutes)")
 
@@ -7644,6 +7645,103 @@ def _prune_suggestions_scan_jobs():
         ]
         for job_id in stale_ids:
             SUGGESTIONS_SCAN_JOBS.pop(job_id, None)
+
+
+_SUGGESTIONS_AUTO_SCAN_STATE = {"last_incremental": 0.0, "last_full_date": None}
+_SUGGESTIONS_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+
+def _suggestions_scan_running() -> bool:
+    with SUGGESTIONS_SCAN_JOBS_LOCK:
+        return any(job.get("status") == "running" for job in SUGGESTIONS_SCAN_JOBS.values())
+
+
+def _suggestions_auto_scan_due(now=None, state=None):
+    """What the scan schedule owes right now: 'full', 'incremental' or None.
+
+    The interval and the weekly full refresh are read from the live settings on
+    every call, so changing them in Settings takes effect without a restart. The
+    full refresh runs once on its day, at or after its time.
+    """
+    if not env_truthy('SUGGESTIONS_ENABLED'):
+        return None
+    now = now or datetime.now()
+    state = _SUGGESTIONS_AUTO_SCAN_STATE if state is None else state
+
+    day = (os.environ.get('SUGGESTIONS_FULL_REFRESH_DAY') or 'off').strip().lower()
+    at = (os.environ.get('SUGGESTIONS_FULL_REFRESH_TIME') or '04:00').strip()
+    if day in _SUGGESTIONS_WEEKDAYS and now.strftime('%A').lower() == day \
+            and now.strftime('%H:%M') >= at and state.get("last_full_date") != now.date().isoformat():
+        return 'full'
+
+    try:
+        minutes = int(float(os.environ.get('SUGGESTIONS_AUTO_SCAN_MINUTES') or 0))
+    except (TypeError, ValueError):
+        minutes = 0
+    if minutes > 0 and now.timestamp() - float(state.get("last_incremental") or 0) >= minutes * 60:
+        return 'incremental'
+    return None
+
+
+def _run_scheduled_suggestions_scan(full: bool):
+    """Start a scan the way the Suggestions page does, as the primary admin.
+
+    The scan, its cache and any auto-matches are scoped to the user running it;
+    the primary admin is the one account whose clients see the whole library
+    and whose Suggestions page therefore shows the scheduled results."""
+    from src.utils.user_config import _ALLOW_GLOBAL_FALLBACK_KEY
+
+    user_id = None
+    creds = {}
+    try:
+        user_id = database_service._default_user_id() if database_service else None
+        if user_id is not None:
+            creds = dict(database_service.get_user_credentials(user_id) or {})
+    except Exception as e:
+        logger.warning("Scheduled suggestions scan: primary admin lookup failed: %s", e)
+    creds[_ALLOW_GLOBAL_FALLBACK_KEY] = True
+    try:
+        bundle = container.user_client_registry().get_clients(user_id) if user_id is not None else _global_clients
+    except Exception:
+        bundle = _global_clients
+
+    tok_bundle = _active_bundle.set(bundle)
+    tok_uid = set_current_user_id(user_id)
+    tok_creds = set_current_user_credentials(creds)
+    try:
+        if full:
+            _save_persisted_suggestions_cache(_empty_suggestions_cache_payload())
+            cached_by_abs, cached_no_match = {}, []
+        else:
+            persisted = _load_persisted_suggestions_cache()
+            cached_by_abs = persisted.get('scan_cache_by_abs', {}) or {}
+            cached_no_match = persisted.get('scan_cache_no_match_abs_ids', []) or []
+        return _start_suggestions_scan_job(
+            cached_suggestions_by_abs=cached_by_abs,
+            cached_no_match_abs_ids=cached_no_match,
+        )
+    finally:
+        reset_current_user_credentials(tok_creds)
+        reset_current_user_id(tok_uid)
+        _active_bundle.reset(tok_bundle)
+
+
+def _suggestions_auto_scan_tick():
+    """Daemon job: start a scheduled suggestions scan when one is due."""
+    try:
+        due = _suggestions_auto_scan_due()
+        if not due:
+            return
+        if _suggestions_scan_running():
+            return
+        now = datetime.now()
+        _run_scheduled_suggestions_scan(full=(due == 'full'))
+        _SUGGESTIONS_AUTO_SCAN_STATE["last_incremental"] = now.timestamp()
+        if due == 'full':
+            _SUGGESTIONS_AUTO_SCAN_STATE["last_full_date"] = now.date().isoformat()
+        logger.info("🔎 Scheduled suggestions scan started (%s)", due)
+    except Exception as e:
+        logger.warning("Scheduled suggestions scan could not start: %s", e, exc_info=True)
 
 
 def _start_suggestions_scan_job(cached_suggestions_by_abs=None, cached_no_match_abs_ids=None):
