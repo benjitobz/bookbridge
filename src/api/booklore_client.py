@@ -3513,6 +3513,33 @@ class BookloreClient:
             logger.error(f"❌ Error adding book to Grimmory shelf: {e}", exc_info=True)
             return False
 
+    def add_book_id_to_shelf(self, book_id, shelf_name=None):
+        """Add a book to a shelf by its Grimmory id, creating the shelf if needed."""
+        shelf_name = (
+            shelf_name or resolve_setting(self._creds, "BOOKLORE_SHELF_NAME", "")
+        ).strip() or "Kobo"
+        if book_id in (None, ""):
+            return False
+        try:
+            shelf_id = self._get_or_create_shelf_id(shelf_name)
+            if not shelf_id:
+                logger.error(f"❌ Failed to resolve Grimmory shelf id for '{shelf_name}'")
+                return False
+            response = self._make_request("POST", "/api/v1/books/shelves", {
+                "bookIds": [int(book_id)],
+                "shelvesToAssign": [shelf_id],
+                "shelvesToUnassign": []
+            })
+            if response is not None and response.status_code in (200, 201, 204):
+                logger.info(f"🏷️ Added Grimmory book {book_id} to shelf: {shelf_name}")
+                return True
+            logger.error(f"❌ Failed to add Grimmory book {book_id} to '{shelf_name}'. Status: "
+                         f"{response.status_code if response is not None else 'No response'}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Error adding Grimmory book {book_id} to shelf: {e}", exc_info=True)
+            return False
+
     def remove_from_shelf(self, ebook_filename, shelf_name=None):
         """Remove a book from a shelf."""
         shelf_name = (
