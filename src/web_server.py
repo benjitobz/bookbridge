@@ -1840,6 +1840,7 @@ def sync_daemon():
         schedule.every(1).hours.do(_run_diagnostics_send)
         schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_reconcile_shared_library)
         schedule.every(1).minutes.do(_suggestions_auto_scan_tick)
+        schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_mirror_kosync_logins_from_grimmory)
 
         logger.info(f"🔄 Sync daemon started (period: {SYNC_PERIOD_MINS} minutes)")
 
@@ -1856,6 +1857,8 @@ def sync_daemon():
             _run_diagnostics_send()
         except Exception:
             pass
+
+        _mirror_kosync_logins_from_grimmory()
 
         # Main daemon loop
         while True:
@@ -1884,6 +1887,43 @@ def _reconcile_shared_library():
             )
     except Exception as e:
         logger.warning("Shared-library reconcile failed: %s", e)
+
+
+def _mirror_kosync_logins_from_grimmory():
+    if not env_truthy('KOSYNC_CREDENTIALS_FROM_GRIMMORY') or database_service is None:
+        return
+    try:
+        registry = container.user_client_registry()
+        users = [u for u in database_service.list_users() if u.active]
+    except Exception as e:
+        logger.warning("KoSync login mirror: could not list users: %s", e)
+        return
+    updated = 0
+    for user in users:
+        try:
+            client = registry.get_clients(user.id).booklore_client
+            if client is None or not client.is_configured():
+                continue
+            login = client.get_koreader_sync_login()
+            if not login:
+                continue
+            username, password = login
+            creds = database_service.get_user_credentials(user.id) or {}
+            changed = []
+            if (creds.get("KOSYNC_USER") or "") != username:
+                database_service.set_user_credential(user.id, "KOSYNC_USER", username)
+                changed.append("username")
+            if (creds.get("KOSYNC_KEY") or "") != password:
+                database_service.set_user_credential(user.id, "KOSYNC_KEY", password)
+                changed.append("password")
+            if changed:
+                registry.invalidate(user.id)
+                updated += 1
+                logger.info("🔑 KoSync login for '%s' taken from Grimmory (%s)",
+                            sanitize_log_data(user.username), ", ".join(changed))
+        except Exception as e:
+            logger.warning("KoSync login mirror failed for user %s: %s", user.id, e)
+    return updated
 
 
 # ---------------- ORIGINAL ABS-KOSYNC HELPERS ----------------
@@ -4096,6 +4136,7 @@ def settings():
             return redirect(url_for('settings') + '#users')
 
         bool_keys = [
+            'KOSYNC_CREDENTIALS_FROM_GRIMMORY',
             'KOSYNC_USE_PERCENTAGE_FROM_SERVER',
             'KOSYNC_AUTO_MAP_ON_AGREEMENT',
             'KOSYNC_HASH_RECONCILE_ENABLED',
