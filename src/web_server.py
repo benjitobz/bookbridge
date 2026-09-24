@@ -1790,17 +1790,41 @@ def _run_diagnostics_send(
     )
 
 
+def _reconcile_shared_library():
+    """Keep every active user linked to every book while share-all-books is on.
+
+    Runs on the sync schedule so accounts created outside the dashboard and
+    books that arrived without passing the claim helper still end up shared,
+    without anyone pressing the Users page button.
+    """
+    if not env_truthy('SHARE_ALL_BOOKS_WITH_ALL_USERS'):
+        return
+    try:
+        result = database_service.share_all_books_with_active_users()
+        links = int(result.get('links', 0) or 0)
+        if links:
+            logger.info(
+                "🔗 Shared %d book link(s) across %d user(s) (share-all-books schedule)",
+                links, result.get('users', 0),
+            )
+    except Exception as e:
+        logger.warning("Shared-library reconcile failed: %s", e)
+
+
 def sync_daemon():
     """Background sync daemon running in a separate thread."""
     try:
         # Setup schedule for sync operations
         # Use the global SYNC_PERIOD_MINS which is validated
         schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(manager.run_sync_for_all_users)
+        schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_reconcile_shared_library)
         schedule.every(1).minutes.do(manager.check_pending_jobs)
         schedule.every(1).minutes.do(manager.flush_reading_sessions_for_all_users)
         schedule.every(1).hours.do(_run_diagnostics_send)
 
         logger.info(f"🔄 Sync daemon started (period: {SYNC_PERIOD_MINS} minutes)")
+
+        _reconcile_shared_library()
 
         # Run initial sync cycle (per user)
         try:

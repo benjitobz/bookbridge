@@ -984,8 +984,26 @@ class DatabaseService:
             session.refresh(book)
             session.expunge(book)
 
+        self._share_new_book_if_enabled(book)
         self._notify_catalog_change()
         return book
+
+    def _share_new_book_if_enabled(self, book: Book) -> None:
+        """Fan a new catalog row out to every active user while share-all-books is on.
+
+        The dashboard's claim helper already does this for matches made through
+        the UI; doing it at creation covers every other path (auto-match,
+        suggestions, scans) so the setting means the same thing everywhere.
+        """
+        if os.environ.get("SHARE_ALL_BOOKS_WITH_ALL_USERS", "false").strip().lower() not in ("true", "1", "yes", "on"):
+            return
+        abs_id = getattr(book, "abs_id", None)
+        try:
+            created = self.link_book_to_all_active_users(abs_id)
+            if created:
+                logger.info("🔗 Shared new book '%s' with %d user(s) (share-all-books)", abs_id, created)
+        except Exception as e:
+            logger.warning("Could not share new book '%s' with all users: %s", abs_id, e)
 
     def save_book(self, book: Book) -> Book:
         """Save or update a book model."""
