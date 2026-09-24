@@ -1838,8 +1838,11 @@ def sync_daemon():
         schedule.every(1).minutes.do(manager.check_pending_jobs)
         schedule.every(1).minutes.do(manager.flush_reading_sessions_for_all_users)
         schedule.every(1).hours.do(_run_diagnostics_send)
+        schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_reconcile_shared_library)
 
         logger.info(f"🔄 Sync daemon started (period: {SYNC_PERIOD_MINS} minutes)")
+
+        _reconcile_shared_library()
 
         # Run initial sync cycle (per user)
         try:
@@ -1865,6 +1868,21 @@ def sync_daemon():
 
     except Exception as e:
         logger.error(f"❌ Sync daemon crashed: {e}", exc_info=True)
+
+
+def _reconcile_shared_library():
+    if not env_truthy('SHARE_ALL_BOOKS_WITH_ALL_USERS'):
+        return
+    try:
+        result = database_service.share_all_books_with_active_users()
+        links = int(result.get('links', 0) or 0)
+        if links:
+            logger.info(
+                "🔗 Shared %d book link(s) across %d user(s) (share-all-books schedule)",
+                links, result.get('users', 0),
+            )
+    except Exception as e:
+        logger.warning("Shared-library reconcile failed: %s", e)
 
 
 # ---------------- ORIGINAL ABS-KOSYNC HELPERS ----------------
