@@ -123,6 +123,7 @@ The bridge **is** a KoSync server — KOReader devices sync directly with it. De
 | --- | --- | --- | --- |
 | Enable | `KOSYNC_ENABLED` | `false` | Turns on KOSync support. |
 | Hash Method | `KOSYNC_HASH_METHOD` | `content` | `content` is safest. `filename` is faster but less reliable. |
+| Sync Login From Grimmory | `KOSYNC_CREDENTIALS_FROM_GRIMMORY` | `false` | Global. Each sync cycle, every active reader's KOReader sync username and password are copied from their Grimmory account's KOReader login into their per-reader KoSync credentials. |
 | PUT Debounce | `KOSYNC_PUT_DEBOUNCE_SECONDS` | `300` | Wait this long after KOReader stops pushing before running the sync cycle. |
 | Use Percentage from Server | `KOSYNC_USE_PERCENTAGE_FROM_SERVER` | `false` | Uses raw percentage instead of text matching. |
 | Highlight Sync | `KOREADER_ANNOTATION_SYNC` | `true` | Enables bridge-side annotation exchange for the Bridge Sync KOReader plugin. Requires the current Bridge Sync plugin on each device. |
