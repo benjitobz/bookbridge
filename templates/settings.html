@@ -847,6 +847,17 @@
                                 %}>Filename (Fast)</option>
                         </select>
                     </div>
+                    <div class="checkbox-wrapper full-width">
+                        <input type="checkbox" id="kosync_creds_from_grimmory" name="KOSYNC_CREDENTIALS_FROM_GRIMMORY"
+                            {% if get_bool('KOSYNC_CREDENTIALS_FROM_GRIMMORY') %}checked{% endif %}>
+                        <label for="kosync_creds_from_grimmory">Take each reader's sync login from Grimmory</label>
+                        <div class="help-text">Every sync cycle, a reader's KoSync username and password are taken from
+                            the KOReader login of their Grimmory account and keep following it, so the login is
+                            managed on Grimmory's KOReader settings page. A reader who already has a different
+                            KoSync login set here keeps it (clear their KoSync username to switch to the Grimmory
+                            one), and a Grimmory username another user here already has is skipped; both are
+                            logged as warnings. Readers without a Grimmory KOReader login are left alone.</div>
+                    </div>
                     <div class="form-group full-width">
                         <label>KoSync PUT debounce seconds</label>
                         <input type="number" min="0" name="KOSYNC_PUT_DEBOUNCE_SECONDS"

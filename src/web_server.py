@@ -1,4 +1,5 @@
 import glob
+import hashlib
 import hmac
 import html
 import logging
@@ -1829,17 +1830,127 @@ def _run_diagnostics_send(
     )
 
 
+KOSYNC_MIRRORED_LOGIN_KEY = "KOSYNC_MIRRORED_LOGIN"
+
+
+def _kosync_login_fingerprint(username, password):
+    return hashlib.sha256(f"{username}\0{password}".encode("utf-8")).hexdigest()
+
+
+def _mirror_kosync_login(user, registry, holders):
+    client = registry.get_clients(user.id).booklore_client
+    if not client.is_configured():
+        return False
+    login = client.get_koreader_sync_login()
+    if not login:
+        return False
+    username, password = login
+    conditions = get_persistent_condition_logger()
+    reader = sanitize_log_data(user.username)
+
+    collision_key = f"kosync_login_mirror_collision:{user.id}"
+    holder = holders.get(username.lower())
+    if holder is not None and holder.id != user.id:
+        conditions.warn(
+            logger, collision_key,
+            "⚠️ KoSync login for '%s' not taken from Grimmory: the username '%s' already belongs to '%s'",
+            reader, sanitize_log_data(username), sanitize_log_data(holder.username),
+        )
+        return False
+    conditions.resolve(logger, collision_key, "KoSync username for '%s' no longer belongs to another user", reader)
+
+    creds = database_service.get_user_credentials(user.id)
+    stored_user = creds.get("KOSYNC_USER") or ""
+    stored_key = creds.get("KOSYNC_KEY") or ""
+    mirrored = creds.get(KOSYNC_MIRRORED_LOGIN_KEY)
+    own_login_key = f"kosync_login_mirror_kept:{user.id}"
+    if (
+        stored_user and stored_key
+        and (stored_user, stored_key) != (username, password)
+        and mirrored != _kosync_login_fingerprint(stored_user, stored_key)
+    ):
+        conditions.warn(
+            logger, own_login_key,
+            "⚠️ KoSync login for '%s' was set in BookBridge and is kept; clear their KoSync username "
+            "to take the login from Grimmory",
+            reader,
+        )
+        return False
+    conditions.resolve(logger, own_login_key, "KoSync login for '%s' now follows Grimmory", reader)
+
+    changed = []
+    if stored_user != username:
+        database_service.set_user_credential(user.id, "KOSYNC_USER", username)
+        changed.append("username")
+    if stored_key != password:
+        database_service.set_user_credential(user.id, "KOSYNC_KEY", password)
+        changed.append("password")
+    fingerprint = _kosync_login_fingerprint(username, password)
+    if mirrored != fingerprint:
+        database_service.set_user_credential(user.id, KOSYNC_MIRRORED_LOGIN_KEY, fingerprint)
+    if not changed:
+        return False
+    registry.invalidate(user.id)
+    holders[username.lower()] = user
+    logger.info("🔑 KoSync login for '%s' taken from Grimmory (%s)", reader, ", ".join(changed))
+    return True
+
+
+def _mirror_kosync_logins_from_grimmory():
+    if not env_truthy('KOSYNC_CREDENTIALS_FROM_GRIMMORY') or database_service is None:
+        return
+    conditions = get_persistent_condition_logger()
+    try:
+        registry = container.user_client_registry()
+        users = database_service.list_users()
+        holders = {}
+        for user in users:
+            name = (database_service.get_user_credentials(user.id).get("KOSYNC_USER") or "").lower()
+            if name:
+                holders.setdefault(name, user)
+        global_name = os.environ.get("KOSYNC_USER", "").lower()
+        default_user_id = database_service._default_user_id()
+        default_user = next((user for user in users if user.id == default_user_id), None)
+        if global_name and default_user is not None:
+            holders.setdefault(global_name, default_user)
+    except Exception as e:
+        conditions.warn(
+            logger, "kosync_login_mirror", "KoSync login mirror: could not list users: %s", e, exc_info=True,
+        )
+        return
+    conditions.resolve(logger, "kosync_login_mirror", "KoSync login mirror: users listed again")
+
+    updated = 0
+    for user in users:
+        if not user.active:
+            continue
+        failure_key = f"kosync_login_mirror:{user.id}"
+        try:
+            if _mirror_kosync_login(user, registry, holders):
+                updated += 1
+        except Exception as e:
+            conditions.warn(
+                logger, failure_key, "KoSync login mirror failed for user %s: %s", user.id, e, exc_info=True,
+            )
+        else:
+            conditions.resolve(logger, failure_key, "KoSync login mirror works again for user %s", user.id)
+    return updated
+
+
 def sync_daemon():
     """Background sync daemon running in a separate thread."""
     try:
         # Setup schedule for sync operations
         # Use the global SYNC_PERIOD_MINS which is validated
         schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(manager.run_sync_for_all_users)
+        schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_mirror_kosync_logins_from_grimmory)
         schedule.every(1).minutes.do(manager.check_pending_jobs)
         schedule.every(1).minutes.do(manager.flush_reading_sessions_for_all_users)
         schedule.every(1).hours.do(_run_diagnostics_send)
 
         logger.info(f"🔄 Sync daemon started (period: {SYNC_PERIOD_MINS} minutes)")
+
+        _mirror_kosync_logins_from_grimmory()
 
         # Run initial sync cycle (per user)
         try:
@@ -4077,6 +4188,7 @@ def settings():
             return redirect(url_for('settings') + '#users')
 
         bool_keys = [
+            'KOSYNC_CREDENTIALS_FROM_GRIMMORY',
             'KOSYNC_USE_PERCENTAGE_FROM_SERVER',
             'KOSYNC_AUTO_MAP_ON_AGREEMENT',
             'KOSYNC_HASH_RECONCILE_ENABLED',
