@@ -1030,6 +1030,16 @@
 
                     <!-- Highlight sync is per-user: Settings → Users → (user) → Integrations → Grimmory. -->
 
+                    <div class="checkbox-wrapper full-width">
+                        <input type="checkbox" id="booklore_shelf_require_alignment" name="BOOKLORE_SHELF_REQUIRE_ALIGNMENT"
+                            {% if get_bool('BOOKLORE_SHELF_REQUIRE_ALIGNMENT') %}checked{% endif %}>
+                        <label for="booklore_shelf_require_alignment">Add matched books to the shelf only once they are aligned</label>
+                        <small>Normally a book joins the shelf the moment it is matched. With this on it waits until
+                            BookBridge has built the alignment map, so the shelf only ever lists books whose
+                            audio&harr;text sync is precise. Checked every sync cycle using the global Grimmory
+                            login; books are never removed by this.</small>
+                    </div>
+
                     <!-- Separator -->
                     <div class="full-width" style="margin: 10px 0; border-top: 1px solid rgba(255,255,255,0.1);"></div>
                     <h4 class="full-width" style="font-size: 14px; color: #fff; margin-bottom: -10px;">"Up Next" Shelf Auto-Match</h4>
