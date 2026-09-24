@@ -101,7 +101,7 @@ SUGGESTIONS_STATE_TTL_SECONDS = 86400
 # APP_VERSION the "what's new" banner/page was shown/dismissed for.
 WHATS_NEW_SEEN_KEY = "WHATS_NEW_SEEN_VERSION"
 SUGGESTIONS_CACHE_FILE_NAME = "suggestions_scan_cache.json"
-SUGGESTIONS_CACHE_LOCK = threading.Lock()
+SUGGESTIONS_CACHE_LOCK = threading.RLock()
 # Batch-match queue lives on disk (under DATA_DIR) instead of the Flask session cookie:
 # the cookie caps at ~4KB (~a dozen items) and is per-browser; the file store is
 # unbounded, survives container rebuilds, and is shared across the admin's tabs.
@@ -1836,6 +1836,7 @@ def sync_daemon():
         # Use the global SYNC_PERIOD_MINS which is validated
         schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(manager.run_sync_for_all_users)
         schedule.every(1).minutes.do(manager.check_pending_jobs)
+        schedule.every(1).minutes.do(_suggestions_auto_scan_tick)
         schedule.every(1).minutes.do(manager.flush_reading_sessions_for_all_users)
         schedule.every(1).hours.do(_run_diagnostics_send)
 
@@ -7867,6 +7868,118 @@ def _prune_suggestions_scan_jobs():
             SUGGESTIONS_SCAN_JOBS.pop(job_id, None)
 
 
+SUGGESTIONS_AUTO_SCAN_STATE_KEY = "SUGGESTIONS_AUTO_SCAN_STATE"
+SUGGESTIONS_AUTO_SCAN_MIN_MINUTES = 5
+_SUGGESTIONS_AUTO_SCAN_JOB = {}
+
+
+def _suggestions_auto_scan_due(now, state):
+    day = (os.environ.get('SUGGESTIONS_FULL_REFRESH_DAY') or 'off').strip().lower()
+    if day != 'off':
+        raw_time = (os.environ.get('SUGGESTIONS_FULL_REFRESH_TIME') or '04:00').strip()
+        try:
+            refresh_time = datetime.strptime(raw_time, '%H:%M').time()
+        except ValueError:
+            get_persistent_condition_logger().warn(
+                logger,
+                "suggestions-full-refresh-time",
+                "⚠️ SUGGESTIONS_FULL_REFRESH_TIME '%s' is not an HH:MM time — weekly full refresh is off",
+                sanitize_log_data(raw_time),
+                exc_info=True,
+            )
+        else:
+            get_persistent_condition_logger().resolve(
+                logger, "suggestions-full-refresh-time", "SUGGESTIONS_FULL_REFRESH_TIME is valid again",
+            )
+            if now.strftime('%A').lower() == day and now.time() >= refresh_time \
+                    and state.get("last_full_date") != now.date().isoformat():
+                return 'full'
+
+    try:
+        minutes = int(float(os.environ.get('SUGGESTIONS_AUTO_SCAN_MINUTES') or 0))
+    except (TypeError, ValueError):
+        minutes = 0
+    if minutes <= 0:
+        return None
+    interval_seconds = max(minutes, SUGGESTIONS_AUTO_SCAN_MIN_MINUTES) * 60
+    if now.timestamp() - float(state.get("last_finished") or 0) >= interval_seconds:
+        return 'incremental'
+    return None
+
+
+def _run_scheduled_suggestions_scan(full: bool):
+    from src.utils.user_config import _ALLOW_GLOBAL_FALLBACK_KEY
+
+    user_id = database_service._default_user_id()
+    if user_id is None:
+        return None
+    creds = dict(database_service.get_user_credentials(user_id) or {})
+    creds[_ALLOW_GLOBAL_FALLBACK_KEY] = _global_fallback_allowed(
+        database_service, database_service.get_user(user_id),
+    )
+
+    tok_bundle = _active_bundle.set(container.user_client_registry().get_clients(user_id))
+    tok_uid = set_current_user_id(user_id)
+    tok_creds = set_current_user_credentials(creds)
+    try:
+        if full:
+            _save_persisted_suggestions_cache(_empty_suggestions_cache_payload(scanned_at=time.time()))
+            cached_by_abs, cached_no_match = {}, []
+        else:
+            persisted = _load_persisted_suggestions_cache()
+            cached_by_abs = persisted.get('scan_cache_by_abs', {}) or {}
+            cached_no_match = persisted.get('scan_cache_no_match_abs_ids', []) or []
+        return _start_suggestions_scan_job(
+            cached_suggestions_by_abs=cached_by_abs,
+            cached_no_match_abs_ids=cached_no_match,
+        )
+    finally:
+        reset_current_user_credentials(tok_creds)
+        reset_current_user_id(tok_uid)
+        _active_bundle.reset(tok_bundle)
+
+
+def _suggestions_auto_scan_tick():
+    if not env_truthy('SUGGESTIONS_ENABLED'):
+        return
+    try:
+        state = database_service.get_json_setting(SUGGESTIONS_AUTO_SCAN_STATE_KEY, default={})
+        if not isinstance(state, dict):
+            state = {}
+
+        if _SUGGESTIONS_AUTO_SCAN_JOB:
+            job = _get_suggestions_scan_job(_SUGGESTIONS_AUTO_SCAN_JOB["job_id"])
+            if job and job["status"] == "running":
+                return
+            state["last_finished"] = job["updated_at"] if job else time.time()
+            if _SUGGESTIONS_AUTO_SCAN_JOB["full_date"]:
+                state["last_full_date"] = _SUGGESTIONS_AUTO_SCAN_JOB["full_date"]
+            database_service.set_json_setting(SUGGESTIONS_AUTO_SCAN_STATE_KEY, state)
+            with SUGGESTIONS_SCAN_JOBS_LOCK:
+                SUGGESTIONS_SCAN_JOBS.pop(_SUGGESTIONS_AUTO_SCAN_JOB["job_id"], None)
+            _SUGGESTIONS_AUTO_SCAN_JOB.clear()
+
+        now = datetime.now(_get_stats_timezone())
+        due = _suggestions_auto_scan_due(now, state)
+        with SUGGESTIONS_SCAN_JOBS_LOCK:
+            scan_running = any(job.get("status") == "running" for job in SUGGESTIONS_SCAN_JOBS.values())
+        if due and not scan_running:
+            job_id = _run_scheduled_suggestions_scan(full=(due == 'full'))
+            if job_id:
+                _SUGGESTIONS_AUTO_SCAN_JOB.update(
+                    job_id=job_id,
+                    full_date=now.date().isoformat() if due == 'full' else None,
+                )
+                logger.info("🔎 Scheduled suggestions scan started (%s)", due)
+        get_persistent_condition_logger().resolve(
+            logger, "suggestions-auto-scan", "Scheduled suggestions scans resumed",
+        )
+    except Exception as e:
+        get_persistent_condition_logger().warn(
+            logger, "suggestions-auto-scan", "Scheduled suggestions scan tick failed: %s", e, exc_info=True,
+        )
+
+
 def _start_suggestions_scan_job(cached_suggestions_by_abs=None, cached_no_match_abs_ids=None):
     _prune_suggestions_scan_jobs()
     job_id = uuid.uuid4().hex
@@ -8048,16 +8161,19 @@ def _run_suggestions_scan_job(job_id, cached_suggestions_by_abs=None, cached_no_
             progress_callback=update_progress,
         )
         results = _auto_match_suggestions(results, get_current_user_id())
+        scanned_at = time.time()
         _save_persisted_suggestions_cache({
             "scan_cache_by_abs": results.get('cache_by_abs', {}) if isinstance(results, dict) else {},
             "scan_cache_no_match_abs_ids": results.get('no_match_abs_ids', []) if isinstance(results, dict) else [],
             "scan_last_stats": results.get('stats', {}) if isinstance(results, dict) else {},
+            "scanned_at": scanned_at,
         })
         status = "done"
         error = None
     except Exception as e:
         logger.exception(f"Suggestions scan job failed ({job_id}): {e}")
         results = {}
+        scanned_at = 0.0
         status = "error"
         error = str(e)
         update_progress({
@@ -8076,6 +8192,7 @@ def _run_suggestions_scan_job(job_id, cached_suggestions_by_abs=None, cached_no_
                 "status": status,
                 "results": results,
                 "error": error,
+                "scanned_at": scanned_at,
                 "updated_at": time.time(),
             })
 
@@ -8125,6 +8242,7 @@ def _default_suggestions_state():
         "scan_cache_by_abs": {},
         "scan_cache_no_match_abs_ids": [],
         "scan_last_stats": {},
+        "scanned_at": 0.0,
         "scan_has_run": False,
         "created_at": now,
         "updated_at": now,
@@ -8171,11 +8289,12 @@ def _suggestions_cache_file_path(user_id=None):
     return DATA_DIR / f"suggestions_scan_cache_{scope}.json"
 
 
-def _empty_suggestions_cache_payload():
+def _empty_suggestions_cache_payload(scanned_at=0.0):
     return {
         "scan_cache_by_abs": {},
         "scan_cache_no_match_abs_ids": [],
         "scan_last_stats": {},
+        "scanned_at": scanned_at,
         "updated_at": time.time(),
     }
 
@@ -8197,10 +8316,12 @@ def _load_persisted_suggestions_cache():
         cache_by_abs = raw.get('scan_cache_by_abs', {})
         no_match = raw.get('scan_cache_no_match_abs_ids', [])
         stats = raw.get('scan_last_stats', {})
+        scanned_at = raw.get('scanned_at', 0.0)
 
         payload['scan_cache_by_abs'] = cache_by_abs if isinstance(cache_by_abs, dict) else {}
         payload['scan_cache_no_match_abs_ids'] = no_match if isinstance(no_match, list) else []
         payload['scan_last_stats'] = stats if isinstance(stats, dict) else {}
+        payload['scanned_at'] = scanned_at if isinstance(scanned_at, (int, float)) else 0.0
 
     return payload
 
@@ -8213,6 +8334,7 @@ def _save_persisted_suggestions_cache(payload):
         "scan_cache_by_abs": payload.get('scan_cache_by_abs', {}) if isinstance(payload.get('scan_cache_by_abs', {}), dict) else {},
         "scan_cache_no_match_abs_ids": payload.get('scan_cache_no_match_abs_ids', []) if isinstance(payload.get('scan_cache_no_match_abs_ids', []), list) else [],
         "scan_last_stats": payload.get('scan_last_stats', {}) if isinstance(payload.get('scan_last_stats', {}), dict) else {},
+        "scanned_at": payload.get('scanned_at') or 0.0,
         "updated_at": time.time(),
     }
 
@@ -8234,25 +8356,29 @@ def _rehydrate_suggestions_state_from_cache(suggestions_state: dict) -> dict:
     """Rehydrate in-memory suggestions state from the persisted per-user cache.
 
     If the state already has scan results (non-empty scan_cache_by_abs), the
-    in-memory state wins and the cache is not applied. Otherwise, loads the
-    persisted cache and populates the state with its contents, including
-    rebuilding scan_results sorted by top match score descending.
+    in-memory state wins unless the persisted cache comes from a newer scan
+    (its scanned_at is ahead of the state's), as after a scheduled scan.
+    Otherwise, loads the persisted cache and populates the state with its
+    contents, including rebuilding scan_results sorted by top match score
+    descending.
     """
     if not suggestions_state:
         return suggestions_state
 
-    if suggestions_state.get('scan_cache_by_abs'):
+    persisted = _load_persisted_suggestions_cache()
+    newer_scan = persisted['scanned_at'] > suggestions_state.get('scanned_at', 0.0)
+    if suggestions_state.get('scan_cache_by_abs') and not newer_scan:
         return suggestions_state
 
-    persisted = _load_persisted_suggestions_cache()
     cache_by_abs = persisted.get('scan_cache_by_abs', {}) or {}
-    if not cache_by_abs:
+    if not cache_by_abs and not newer_scan:
         return suggestions_state
 
     suggestions_state['scan_cache_by_abs'] = cache_by_abs
     suggestions_state['scan_cache_no_match_abs_ids'] = persisted.get('scan_cache_no_match_abs_ids', []) or []
     suggestions_state['scan_last_stats'] = persisted.get('scan_last_stats', {}) or {}
-    suggestions_state['scan_has_run'] = True
+    suggestions_state['scanned_at'] = persisted['scanned_at']
+    suggestions_state['scan_has_run'] = bool(cache_by_abs or suggestions_state['scan_last_stats'])
     suggestions_state['updated_at'] = time.time()
 
     suggestions_list = list(cache_by_abs.values())
@@ -8264,6 +8390,18 @@ def _rehydrate_suggestions_state_from_cache(suggestions_state: dict) -> dict:
 
     logger.info(f"♻️ Restored {len(suggestions_list)} cached suggestion(s) from the persisted scan cache")
     return suggestions_state
+
+
+def _persist_suggestions_state(suggestions_state: dict) -> None:
+    with SUGGESTIONS_CACHE_LOCK:
+        if _load_persisted_suggestions_cache()['scanned_at'] > suggestions_state.get('scanned_at', 0.0):
+            return
+        _save_persisted_suggestions_cache({
+            "scan_cache_by_abs": suggestions_state.get('scan_cache_by_abs', {}),
+            "scan_cache_no_match_abs_ids": suggestions_state.get('scan_cache_no_match_abs_ids', []),
+            "scan_last_stats": suggestions_state.get('scan_last_stats', {}),
+            "scanned_at": suggestions_state.get('scanned_at', 0.0),
+        })
 
 
 def _match_queue_file_path():
@@ -8542,8 +8680,12 @@ def suggestions_page():
                 suggestions_state['scan_results'] = []
                 suggestions_state['scan_has_run'] = False
                 suggestions_state['updated_at'] = time.time()
-                _save_persisted_suggestions_cache(_empty_suggestions_cache_payload())
+                suggestions_state['scanned_at'] = suggestions_state['updated_at']
+                _save_persisted_suggestions_cache(
+                    _empty_suggestions_cache_payload(scanned_at=suggestions_state['scanned_at'])
+                )
             else:
+                suggestions_state = _rehydrate_suggestions_state_from_cache(suggestions_state)
                 state_cache = suggestions_state.get('scan_cache_by_abs', {}) or {}
                 state_no_match = suggestions_state.get('scan_cache_no_match_abs_ids', []) or []
                 if state_cache or state_no_match:
@@ -8709,13 +8851,10 @@ def suggestions_page():
                 suggestions_state['scan_cache_by_abs'] = scan_payload.get('cache_by_abs', {})
                 suggestions_state['scan_cache_no_match_abs_ids'] = scan_payload.get('no_match_abs_ids', [])
                 suggestions_state['scan_last_stats'] = scan_payload.get('stats', {})
+                suggestions_state['scanned_at'] = scan_job.get('scanned_at') or time.time()
                 suggestions_state['scan_has_run'] = True
                 suggestions_state['updated_at'] = time.time()
-                _save_persisted_suggestions_cache({
-                    "scan_cache_by_abs": suggestions_state.get('scan_cache_by_abs', {}),
-                    "scan_cache_no_match_abs_ids": suggestions_state.get('scan_cache_no_match_abs_ids', []),
-                    "scan_last_stats": suggestions_state.get('scan_last_stats', {}),
-                })
+                _persist_suggestions_state(suggestions_state)
                 session.pop('suggestions_scan_job_id', None)
                 session.modified = True
                 with SUGGESTIONS_SCAN_JOBS_LOCK:
@@ -8758,11 +8897,7 @@ def suggestions_page():
             suggestions_state['scan_cache_no_match_abs_ids'] = filtered_no_match_abs_ids
             no_match_abs_ids = filtered_no_match_abs_ids
             suggestions_state['updated_at'] = time.time()
-        _save_persisted_suggestions_cache({
-            "scan_cache_by_abs": suggestions_state.get('scan_cache_by_abs', {}),
-            "scan_cache_no_match_abs_ids": suggestions_state.get('scan_cache_no_match_abs_ids', []),
-            "scan_last_stats": suggestions_state.get('scan_last_stats', {}),
-        })
+        _persist_suggestions_state(suggestions_state)
 
     active_suggestion_keys = set()
     for book in database_service.get_all_books():
@@ -8806,11 +8941,7 @@ def suggestions_page():
             suggestions_state['scan_cache_no_match_abs_ids'] = filtered_no_match_abs_ids
             no_match_abs_ids = filtered_no_match_abs_ids
             suggestions_state['updated_at'] = time.time()
-        _save_persisted_suggestions_cache({
-            "scan_cache_by_abs": suggestions_state.get('scan_cache_by_abs', {}),
-            "scan_cache_no_match_abs_ids": suggestions_state.get('scan_cache_no_match_abs_ids', []),
-            "scan_last_stats": suggestions_state.get('scan_last_stats', {}),
-        })
+        _persist_suggestions_state(suggestions_state)
 
     def _normalize_suggestion_identity_part(value):
         normalized = re.sub(r'[\W_]+', ' ', str(value or '').lower()).strip()
@@ -8848,11 +8979,7 @@ def suggestions_page():
             cache_by_abs = filtered_cache_by_abs
             suggestions_state['scan_cache_by_abs'] = filtered_cache_by_abs
         suggestions_state['updated_at'] = time.time()
-        _save_persisted_suggestions_cache({
-            "scan_cache_by_abs": suggestions_state.get('scan_cache_by_abs', {}),
-            "scan_cache_no_match_abs_ids": suggestions_state.get('scan_cache_no_match_abs_ids', []),
-            "scan_last_stats": suggestions_state.get('scan_last_stats', {}),
-        })
+        _persist_suggestions_state(suggestions_state)
 
     return render_template(
         'suggestions.html',
@@ -10150,7 +10277,13 @@ def _get_stats_timezone():
     try:
         return ZoneInfo(tz_name)
     except Exception:
-        logger.warning("Invalid TZ '%s' for stats, falling back to America/New_York", tz_name, exc_info=True)
+        get_persistent_condition_logger().warn(
+            logger,
+            f"invalid-tz:{tz_name}",
+            "Invalid TZ '%s' for stats, falling back to America/New_York",
+            tz_name,
+            exc_info=True,
+        )
         return ZoneInfo("America/New_York")
 
 

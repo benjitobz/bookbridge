@@ -524,11 +524,16 @@ Enabled under **Settings -> Features**. The Suggestions page is a review workspa
 | Setting | Env Var | Default | Notes |
 | --- | --- | --- | --- |
 | Enable Suggestions | `SUGGESTIONS_ENABLED` | `false` | Enables the Suggestions page and background suggestion discovery. |
+| Scheduled Scan Interval | `SUGGESTIONS_AUTO_SCAN_MINUTES` | `0` | Minutes between scheduled library scans, counted from the end of the previous one (0 = off, minimum 5). Runs as the primary admin, reusing cached results like a normal scan. |
+| Weekly Full Refresh Day | `SUGGESTIONS_FULL_REFRESH_DAY` | `off` | `off` or a weekday. Once a week the scan cache is cleared and the whole unmatched library is rescanned. |
+| Weekly Full Refresh Time | `SUGGESTIONS_FULL_REFRESH_TIME` | `04:00` | Time of day (`HH:MM`, in the `TZ` timezone) at or after which the weekly full refresh runs. An invalid value turns the weekly refresh off and logs a warning. |
 
 Suggestions notes:
 
 - A normal scan reuses cached results so repeat scans are faster.
 - **Full Refresh** rescans the whole unmatched library from scratch.
+- Scheduled scans never overlap a running scan, and a slow scan pushes the next one back instead of queueing it. The time of the last scheduled scan and the day of the last weekly refresh are stored, so a restart neither scans straight away nor repeats a refresh already done that day.
+- A scheduled scan uses the primary admin's own credentials, the same as that account pressing the buttons on the Suggestions page. An open Suggestions page shows the scheduled results the next time it loads.
 - Suggestions can queue audiobook-backed links from Audiobookshelf, Grimmory, or BookOrbit, and can use CWA as the ebook side for audiobook-backed, ebook-only, and Storyteller-assisted links.
 - If your audio and ebook providers expose the same mounted `/books` tree,
   sibling files in the same title folder are treated as same-folder matches
