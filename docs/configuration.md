@@ -499,6 +499,9 @@ Enabled under **Settings -> Features**. The Suggestions page is a review workspa
 | Setting | Env Var | Default | Notes |
 | --- | --- | --- | --- |
 | Enable Suggestions | `SUGGESTIONS_ENABLED` | `false` | Enables the Suggestions page and background suggestion discovery. |
+| Scheduled Scan Interval | `SUGGESTIONS_AUTO_SCAN_MINUTES` | `0` | Minutes between scheduled library scans (0 = off). Runs as the primary admin, reusing cached results like a normal scan. |
+| Weekly Full Refresh Day | `SUGGESTIONS_FULL_REFRESH_DAY` | `off` | `off` or a weekday. Once a week the scan cache is cleared and the whole unmatched library is rescanned. |
+| Weekly Full Refresh Time | `SUGGESTIONS_FULL_REFRESH_TIME` | `04:00` | Local time (HH:MM) at or after which the weekly full refresh runs. |
 
 Suggestions notes:
 
