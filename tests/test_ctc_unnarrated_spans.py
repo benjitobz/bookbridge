@@ -20,6 +20,12 @@ def lexical_gap(gap=2000, seconds=1.0):
     return text, anchors, (4059, 4000 + gap)
 
 
+@pytest.fixture(autouse=True)
+def _mms_ctc_model(monkeypatch):
+    """These tests exercise the MMS (torch) aligner, not the QuartzNet default."""
+    monkeypatch.setenv("CTC_MODEL", "mms_fa")
+
+
 # Anchors are 12-gram starts, so a real gap's bracketing pair always spans ~12
 # narrated words (several seconds) — detection must key on density, not an absolute
 # Δts cap, or it silently misses gaps in normally-paced books.

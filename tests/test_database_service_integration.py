@@ -339,6 +339,27 @@ class TestDatabaseServiceIntegration(unittest.TestCase):
         # Re-running is a no-op (nothing left NULL).
         self.assertEqual(self.db_service.backfill_alignment_methods(), 0)
 
+    def test_get_readalong_alignment_book_ids_accepts_lexical_timed(self):
+        """Finding 4 (P2): 'lexical_timed' (measured word timings) must be
+        treated the same as 'ctc'/'lexical' for read-along eligibility --
+        previously it was silently excluded, giving a book with real
+        word-level timing a disabled dashboard button. Coarser methods stay
+        excluded."""
+        self._seed_alignment('ctc-book', 'CTC Book', points=10, method='ctc')
+        self._seed_alignment('lex-book', 'Lexical Book', points=10, method='lexical')
+        self._seed_alignment('lex-timed-book', 'Lexical Timed Book', points=10, method='lexical_timed')
+        self._seed_alignment('linear-book', 'Linear Book', points=10, method='linear')
+        self._seed_alignment('llm-book', 'LLM Anchor Book', points=10, method='llm_anchor')
+        self._seed_alignment('storyteller-book', 'Storyteller Book', points=10, method='storyteller')
+        self._seed_alignment('null-book', 'Legacy Null Book', points=10, method=None)
+
+        eligible = self.db_service.get_readalong_alignment_book_ids()
+
+        self.assertEqual(
+            eligible,
+            {'ctc-book', 'lex-book', 'lex-timed-book'},
+        )
+
     def test_backfill_alignment_methods_does_not_disturb_last_updated(self):
         """backfill_alignment_methods classifies a pre-existing map by shape
         (see _seed_alignment); it never rebuilds the map, so last_updated
@@ -1537,6 +1558,57 @@ class TestDatabaseServiceIntegration(unittest.TestCase):
                 self.assertNotIn('booklore', state_clients)
             finally:
                 migration_db_service.db_manager.close()
+
+    def test_readalong_epub_requested_defaults_false(self):
+        """A freshly-saved book has no read-along intent unless explicitly set."""
+        self.db_service.save_book(self.Book(abs_id="ra-default", abs_title="RA Default", status="active"))
+        book = self.db_service.get_book("ra-default")
+        self.assertFalse(book.readalong_epub_requested)
+
+    def test_set_readalong_epub_requested_persists_and_reads_back(self):
+        """The intent is read back from the DB row, not from any in-memory Book
+        object the caller happens to be holding -- required so the flag survives
+        a container restart between match and forge completion."""
+        self.db_service.save_book(self.Book(abs_id="ra-set", abs_title="RA Set", status="forging"))
+        updated = self.db_service.set_readalong_epub_requested("ra-set", True)
+        self.assertTrue(updated)
+
+        # A fresh read (a new session, as a restarted process would do) sees it.
+        reread = self.db_service.get_book("ra-set")
+        self.assertTrue(reread.readalong_epub_requested)
+
+    def test_set_readalong_epub_requested_missing_book_returns_false(self):
+        """Recording intent for a book that doesn't exist is a no-op, not an error."""
+        self.assertFalse(self.db_service.set_readalong_epub_requested("no-such-book", True))
+
+    def test_set_readalong_epub_requested_can_clear(self):
+        self.db_service.save_book(self.Book(abs_id="ra-clear", abs_title="RA Clear", status="forging"))
+        self.db_service.set_readalong_epub_requested("ra-clear", True)
+        self.db_service.set_readalong_epub_requested("ra-clear", False)
+        self.assertFalse(self.db_service.get_book("ra-clear").readalong_epub_requested)
+
+    def test_consume_readalong_epub_intent_reads_and_clears_atomically(self):
+        """The load-bearing guarantee for Phase 6b: consuming the intent returns
+        True exactly once. A second forge of the same book (manual re-forge,
+        restart-triggered resume) must never regenerate from a stale flag."""
+        self.db_service.save_book(self.Book(abs_id="ra-consume", abs_title="RA Consume", status="forging"))
+        self.db_service.set_readalong_epub_requested("ra-consume", True)
+
+        first = self.db_service.consume_readalong_epub_intent("ra-consume")
+        self.assertTrue(first)
+
+        # Read back from persistence, not memory -- the flag is actually cleared.
+        self.assertFalse(self.db_service.get_book("ra-consume").readalong_epub_requested)
+
+        second = self.db_service.consume_readalong_epub_intent("ra-consume")
+        self.assertFalse(second)
+
+    def test_consume_readalong_epub_intent_without_prior_request_is_noop(self):
+        self.db_service.save_book(self.Book(abs_id="ra-none", abs_title="RA None", status="active"))
+        self.assertFalse(self.db_service.consume_readalong_epub_intent("ra-none"))
+
+    def test_consume_readalong_epub_intent_missing_book_returns_false(self):
+        self.assertFalse(self.db_service.consume_readalong_epub_intent("no-such-book"))
 
 
 @pytest.mark.real_database_migrations

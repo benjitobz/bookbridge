@@ -220,6 +220,28 @@ class ReadestUploadService:
         server_row = self._pull_server_row(book_hash)
         already_uploaded = self._book_bytes_present(server_row, book_hash)
 
+        if already_uploaded and server_row is None:
+            # The bytes are in storage but no library row came back. Someone
+            # else put this book there — almost certainly Readest's own app,
+            # whose file-sync runs ahead of the library-row push — so a row
+            # very likely exists and is simply not visible to this pull yet.
+            # Pushing now would send a record with no `progress` to carry
+            # forward and NULL the reader's position (the exact hazard the
+            # carry-over block below exists to prevent). The book is already
+            # in Readest; only the group filing is missed, and the next sweep
+            # picks it up once the row lands.
+            logger.info(
+                "Readest publish skipped for %s: bytes already in cloud storage but no "
+                "library row yet (hash=%s) — not pushing a record that would clear the "
+                "reading position",
+                ebook_filename, book_hash,
+            )
+            return ReadestPublishResult(
+                status="skipped",
+                book_hash=book_hash,
+                message="Already present in Readest cloud; library row not visible yet",
+            )
+
         if already_uploaded:
             existing_group = (server_row.get("group_name") or "").strip() if server_row else ""
             if existing_group == effective_group_name:
@@ -368,13 +390,24 @@ class ReadestUploadService:
         via `list_files` for an entry that isn't just the cover blob. If that
         lookup itself fails (returns None), we fall back to trusting
         `uploaded_at` rather than re-uploading blindly on a transient error.
+
+        A missing or not-yet-uploaded server row is NOT proof of absence
+        either. Readest's own app moves a book's bytes through its file-sync
+        engine before the library row reaches the sync table, so a book the
+        user just imported (OPDS, manual add) presents as "no row" while its
+        blob is already in storage. Storage is therefore consulted in that
+        case too — measured live: a book imported at 16:46 was re-uploaded by
+        the sweep at 16:50 under a second key, 242,992 bytes of quota for
+        bytes that were already there.
         """
-        if not server_row or server_row.get("deleted_at") or not server_row.get("uploaded_at"):
+        if server_row and (server_row.get("deleted_at") or not server_row.get("uploaded_at")):
             return False
 
         files = self._client.list_files(book_hash)
         if files is None:
-            return True
+            # A transient lookup failure: trust `uploaded_at` when we have a
+            # row saying so, and stay pessimistic when we have nothing.
+            return bool(server_row)
 
         cover_basename = self._client.cover_file_name(book_hash).rsplit("/", 1)[-1]
         return any(

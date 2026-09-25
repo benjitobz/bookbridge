@@ -98,8 +98,8 @@ def test_storyteller_poller_triggers_on_timestamp_change_with_same_percentage(mo
 def _backdate_write(client_name, abs_id, seconds):
     with write_tracker._writes_lock:
         key = write_tracker._key(client_name, abs_id, None)
-        ts, pct = write_tracker._recent_writes[key]
-        write_tracker._recent_writes[key] = (ts - seconds, pct)
+        entry = write_tracker._recent_writes[key]
+        write_tracker._recent_writes[key] = (entry[0] - seconds, *entry[1:])
 
 
 def test_storyteller_poller_ignores_self_echo_older_than_default_window(monkeypatch):

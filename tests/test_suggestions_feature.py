@@ -37,6 +37,7 @@ class MockContainer:
         self.mock_sync_manager.get_duration.return_value = 3600
 
     def sync_manager(self): return self.mock_sync_manager
+    def forge_service(self): return Mock()
     def abs_client(self): return self.mock_abs_client
     def booklore_client(self): return self.mock_booklore_client
     def storyteller_client(self): return self.mock_storyteller_client

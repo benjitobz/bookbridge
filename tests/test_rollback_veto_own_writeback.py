@@ -150,8 +150,8 @@ class TestMarkerMustEarnTheExclusion(OwnWritebackVetoBase):
     def test_expired_marker_keeps_the_veto(self):
         write_tracker.record_write("BookFusion", "bookorbit:480", BOOKFUSION_PCT)
         key = write_tracker._key("BookFusion", "bookorbit:480", None)
-        _, pct = write_tracker._recent_writes[key]
-        write_tracker._recent_writes[key] = (0.0, pct)  # epoch: far outside any window
+        entry = write_tracker._recent_writes[key]
+        write_tracker._recent_writes[key] = (0.0, *entry[1:])  # epoch: far outside any window
 
         leader, _, logs = self._lead(_manager({"BookOrbit"}), _reported_config())
 

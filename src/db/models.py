@@ -199,6 +199,16 @@ class Book(Base):
     abs_ebook_item_id = Column(String(255), nullable=True)  # Tracks the ebook item separately.
     series_name = Column(String(500), nullable=True, index=True)
     series_sequence = Column(Float, nullable=True)
+    # Read-along EPUB generation intent: set when a NEW match is queued with
+    # the "generate read-along" option checked, since generation needs a
+    # finished alignment map that does not
+    # exist until forging completes. Consumed (cleared) by the post-forge hook
+    # the first time it fires for this book, regardless of outcome, so a later
+    # re-forge never regenerates from a stale flag. Written only through
+    # DatabaseService.set_readalong_epub_requested/consume_readalong_epub_intent
+    # -- deliberately NOT part of save_book's update whitelist, so an unrelated
+    # field save elsewhere can never silently clear or set it as a side effect.
+    readalong_epub_requested = Column(Boolean, nullable=False, default=False)
     # Multi-user: the user who created this match. The catalog row is shared at
     # the schema level, but visibility/serving is scoped to the owner. NULL = the
     # default (admin) user (backfilled at migration time).
@@ -392,6 +402,19 @@ class State(Base):
         return f"<State(abs_id='{self.abs_id}', client='{self.client_name}', pct={self.percentage})>"
 
 
+# Job.kind values. 'alignment' is the pre-existing, undifferentiated kind:
+# every Job row created before this column existed (alignment-build/retry
+# tracking in sync_manager.py, and Forge & Match via
+# `web_server._record_forge_match_job`) belongs to it, and it stays the
+# default so those call sites need no change. 'readalong' isolates read-along
+# EPUB generation jobs so alignment-repair logic
+# (`SyncManager._promote_alignment_backed_book`) can never see or complete
+# them (CLAUDE.md-adjacent finding: a normal sync cycle was falsely marking
+# an in-flight read-along job as done).
+JOB_KIND_ALIGNMENT = "alignment"
+JOB_KIND_READALONG = "readalong"
+
+
 class Job(Base):
     """
     Job model storing job execution data for books.
@@ -404,20 +427,30 @@ class Job(Base):
     retry_count = Column(Integer, default=0)
     last_error = Column(Text)
     progress = Column(Float, default=0.0)
+    kind = Column(String(50), nullable=False, default=JOB_KIND_ALIGNMENT, server_default=JOB_KIND_ALIGNMENT)
+    # Free-text label for the current stage of a long-running job (e.g.
+    # 'transcoding_audio' for read-along generation). Nullable and additive: a
+    # job that never reports a stage (every kind but 'readalong' today) simply
+    # leaves it NULL, and callers treat
+    # None the same as "no stage recorded" rather than an error.
+    stage = Column(String(50), nullable=True)
 
     # Relationship
     book = relationship("Book", back_populates="jobs")
 
     def __init__(self, abs_id: str, last_attempt: float = None,
-                 retry_count: int = 0, last_error: str = None, progress: float = 0.0):
+                 retry_count: int = 0, last_error: str = None, progress: float = 0.0,
+                 kind: str = JOB_KIND_ALIGNMENT, stage: Optional[str] = None):
         self.abs_id = abs_id
         self.last_attempt = last_attempt
         self.retry_count = retry_count
         self.last_error = last_error
         self.progress = progress
+        self.kind = kind
+        self.stage = stage
 
     def __repr__(self):
-        return f"<Job(abs_id='{self.abs_id}', retries={self.retry_count})>"
+        return f"<Job(abs_id='{self.abs_id}', kind='{self.kind}', stage='{self.stage}', retries={self.retry_count})>"
 
 
 
@@ -766,6 +799,65 @@ class KOReaderPageStat(Base):
         self.duration = duration
         self.total_pages = total_pages
         self.uploaded_at = utcnow()
+
+
+class KOReaderBookStatus(Base):
+    """
+    Per-device KOReader reading status, read from each device's ``.sdr`` sidecar.
+
+    KOReader keeps reading status in the sidecar's ``summary`` table
+    (``status`` = reading | complete | abandoned, plus a ``modified`` date), which
+    no existing sync channel carries: KoSync moves position only, and the
+    statistics DB has no status column. One row per (md5, user, device); the
+    cross-device winner is resolved at read time by
+    ``DatabaseService.resolve_koreader_book_status``.
+
+    ``modified`` is the DEVICE's own date for the status change and is stored
+    verbatim as ``YYYY-MM-DD``; ``received_at`` is the bridge's own clock. Both are
+    kept because they answer different questions — see the resolver for how they
+    are ordered.
+    """
+    __tablename__ = 'koreader_book_status'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    md5 = Column(String(32), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)
+    device = Column(String(128), nullable=True)
+    device_id = Column(String(128), nullable=True)
+    device_key = Column(String(128), nullable=False, index=True)
+    status = Column(String(16), nullable=False)
+    modified = Column(String(10), nullable=True)      # KOReader's summary.modified, "YYYY-MM-DD"
+    received_at = Column(Float, nullable=False)       # bridge clock, epoch seconds
+    last_updated = Column(DateTime, default=utcnow, onupdate=utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint('md5', 'user_id', 'device_key', name='uq_koreader_book_status_md5_user_device'),
+    )
+
+    def __init__(
+        self,
+        md5: str,
+        device_key: str,
+        status: str,
+        received_at: float,
+        device: str = None,
+        device_id: str = None,
+        modified: str = None,
+        user_id: int = None,
+    ):
+        self.md5 = md5
+        self.device = device
+        self.device_id = device_id
+        self.device_key = device_key
+        self.user_id = user_id
+        self.status = status
+        self.modified = modified
+        self.received_at = received_at
+        self.last_updated = utcnow()
+
+    def __repr__(self):
+        return (f"<KOReaderBookStatus(md5='{self.md5}', device_key='{self.device_key}', "
+                f"status='{self.status}')>")
 
 
 class KoreaderAnnotation(Base):

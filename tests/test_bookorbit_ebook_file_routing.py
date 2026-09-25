@@ -30,6 +30,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from src.api.bookorbit_client import BookOrbitClient
 from src.sync_clients.sync_client_interface import LocatorResult
+from tests.base_sync_test import BaseSyncCycleTestCase
 
 # The reporter's own book: "Four Nights in May", epub 2576 + m4b 14676. The
 # audiobook is listed FIRST, which is what let file order decide the write.
@@ -137,7 +138,7 @@ def test_ebook_write_accepts_a_cached_primary_file_of_ebook_format(client):
     captured = {}
     ebook_primary = {"id": 3, "primaryFileId": 12, "primaryFormat": "epub"}
 
-    with patch.object(client, "_resolve_primary_file_id") as res, \
+    with patch.object(client, "_resolve_primary_file_id", return_value=None) as res, \
          patch.object(
              client, "_make_request",
              side_effect=lambda m, e, p=None: captured.update(endpoint=e) or _Resp(status_code=204),
@@ -145,8 +146,61 @@ def test_ebook_write_accepts_a_cached_primary_file_of_ebook_format(client):
         ok = client.update_ebook_progress(ebook_primary, 0.5)
 
     assert ok is True
-    res.assert_not_called()
+    res.assert_called_once_with(3, "ebook")
     assert captured["endpoint"] == "/api/v1/books/files/12/progress"
+
+
+@pytest.mark.parametrize("primary_format", ["epub", "kepub"])
+@pytest.mark.parametrize("primary_first", [False, True])
+def test_primary_ebook_is_shared_by_cache_read_and_write(client, primary_format, primary_first):
+    """#443: advancing the primary ebook must survive the next progress read."""
+    primary = {"id": 1, "format": primary_format, "role": "primary"}
+    secondary = {"id": 2, "format": "kepub" if primary_format == "epub" else "epub",
+                 "role": "content"}
+    files = [primary, secondary] if primary_first else [secondary, primary]
+    detail = {"id": 443, "title": "Issue 443", "files": files}
+    info = client._build_light_info(detail)
+    rows = {1: {"fileId": 1, "percentage": 26.0},
+            2: {"fileId": 2, "percentage": 0.0}}
+
+    def request(method, endpoint, payload=None):
+        if method == "GET":
+            return _Resp(list(rows.values()))
+        file_id = int(endpoint.split("/")[-2])
+        rows[file_id].update(payload)
+        return _Resp(status_code=204)
+
+    with patch.object(client, "get_book_detail", return_value=detail), \
+         patch.object(client, "_make_request", side_effect=request):
+        assert client.get_ebook_progress_rich(443)["pct"] == pytest.approx(0.26)
+        assert client.update_ebook_progress(info, 0.488417194869176)
+        assert client.get_ebook_progress_rich(443)["pct"] == pytest.approx(0.488417)
+    assert info["ebookFileId"] == 1
+    assert rows[2]["percentage"] == 0.0
+
+
+def test_detail_primary_overrides_stale_cached_ebook_id(client):
+    """A primary change must not leave writes targeting the old cached ebook."""
+    detail = {"files": [{"id": 2, "format": "kepub", "role": "content"},
+                        {"id": 1, "format": "epub", "role": "primary"}]}
+    with patch.object(client, "get_book_detail", return_value=detail), \
+         patch.object(client, "_make_request", return_value=_Resp(status_code=204)) as req:
+        assert client.update_ebook_progress({"id": 443, "ebookFileId": 2}, 0.49)
+    req.assert_called_once_with("POST", "/api/v1/books/files/1/progress", {"percentage": 49.0})
+
+
+def test_detail_failure_uses_primary_ebook_from_catalog_cache(client):
+    """The detail outage fallback must retain the catalog's primary preference."""
+    info = client._build_light_info({"id": 443, "files": [
+        {"id": 2, "format": "kepub", "role": "content"},
+        {"id": 1, "format": "epub", "role": "primary"},
+    ]})
+    client._book_cache[443] = info
+    with patch.object(client, "get_book_detail", return_value=None), \
+         patch.object(client, "_make_request", return_value=_Resp(status_code=204)) as req:
+        assert client._resolve_primary_file_id(443, "ebook") == 1
+        assert client.update_ebook_progress(info, 0.49)
+    req.assert_called_once_with("POST", "/api/v1/books/files/1/progress", {"percentage": 49.0})
 
 
 def test_ebook_write_resolves_from_a_bare_book_dict(client):
@@ -255,3 +309,110 @@ def test_kind_membership_falls_back_to_the_scalar_kind(client):
     assert client._info_offers_kind({"kinds": ["ebook", "audiobook"]}, "audiobook") is True
     assert client._info_offers_kind({"kinds": []}, "ebook") is False
     assert client._info_offers_kind(None, "ebook") is False
+
+
+class TestPrimaryEbookSyncCycle(BaseSyncCycleTestCase):
+    """Replay #443 through the sync manager and real BookOrbit transport methods."""
+
+    def setUp(self):
+        env = patch.dict(os.environ, {
+            "BOOKORBIT_ENABLED": "true", "BOOKORBIT_SERVER": "http://mock",
+            "BOOKORBIT_USER": "u", "BOOKORBIT_PASSWORD": "p",
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        super().setUp()
+        self.test_book.ebook_source = "BookOrbit"
+        self.test_book.ebook_source_id = "443"
+
+    def get_test_mapping(self):
+        return {"abs_id": "issue-443", "abs_title": "Issue 443",
+                "ebook_filename": "test-book.epub", "status": "active",
+                "transcript_file": os.path.join(self.temp_dir, "transcript.json")}
+
+    def get_test_state_data(self):
+        return {"abs": {"pct": 0.0, "ts": 0.0}, "bookorbit": {"pct": 0.0}}
+
+    def get_expected_leader(self):
+        return "ABS"
+
+    def get_expected_final_percentage(self):
+        return 0.488417194869176
+
+    def get_progress_mock_returns(self):
+        return {"abs_progress": {"currentTime": 484.49, "duration": 1000},
+                "abs_in_progress": [], "kosync_progress": (0.0, None),
+                "storyteller_progress": (0.0, 0.0, None, None),
+                "booklore_progress": (0.0, None)}
+
+    def test_primary_epub_advances_and_next_cycle_does_not_repeat_write(self):
+        from pathlib import Path
+        from unittest.mock import Mock
+
+        from src.sync_clients.abs_sync_client import ABSSyncClient
+        from src.sync_clients.bookorbit_sync_client import BookOrbitSyncClient
+        from src.sync_manager import SyncManager
+
+        mocks = self.setup_common_mocks()
+        client = BookOrbitClient()
+        client.check_connection = Mock(return_value=True)
+        detail = {"id": 443, "title": "Issue 443", "files": [
+            {"id": 2, "format": "kepub", "role": "content"},
+            {"id": 1, "format": "epub", "role": "primary"},
+        ]}
+        client._book_cache[443] = client._build_light_info(detail)
+        rows = {1: {"fileId": 1, "percentage": 26.0},
+                2: {"fileId": 2, "percentage": 0.0}}
+        writes = []
+
+        def request(method, endpoint, payload=None):
+            if endpoint == "/api/v1/books/443":
+                return _Resp(detail)
+            if method == "GET":
+                return _Resp(list(rows.values()))
+            file_id = int(endpoint.split("/")[-2])
+            writes.append(file_id)
+            rows[file_id].update(payload)
+            return _Resp(status_code=204)
+
+        def save_state(state):
+            self.test_states[:] = [s for s in self.test_states if s.client_name != state.client_name]
+            self.test_states.append(state)
+
+        mocks["database_service"].save_state.side_effect = save_state
+        locator = LocatorResult(percentage=self.expected_final_pct,
+                                cfi="epubcfi(/6/42!/4/264:0)")
+        mocks["ebook_parser"].find_text_location.return_value = locator
+        mocks["ebook_parser"].extract_text_and_map.return_value = ("", [])
+        mocks["ebook_parser"].get_perfect_ko_xpath.return_value = None
+        transcriber = Mock()
+        transcriber.get_text_at_time.return_value = "text at the audio position"
+        transcriber.find_time_for_text.return_value = 484.49
+        manager = SyncManager(
+            abs_client=mocks["abs_client"], booklore_client=mocks["booklore_client"],
+            bookorbit_client=client,
+            transcriber=transcriber, ebook_parser=mocks["ebook_parser"],
+            database_service=mocks["database_service"],
+            sync_clients={
+                "ABS": ABSSyncClient(mocks["abs_client"], transcriber, mocks["ebook_parser"]),
+                "BookOrbit": BookOrbitSyncClient(client, mocks["ebook_parser"]),
+            },
+            data_dir=Path(self.temp_dir), books_dir=Path(self.temp_dir) / "books",
+            epub_cache_dir=Path(self.temp_dir) / "epub_cache",
+        )
+        manager._automatch_hardcover = Mock()
+        manager._sync_to_hardcover = Mock()
+        manager._flush_reading_sessions = Mock()
+        manager._get_local_epub = Mock(return_value=str(Path(self.temp_dir) / "books/test-book.epub"))
+        with patch.object(client, "_make_request", side_effect=request), \
+             self.assertLogs(level="DEBUG") as logs:
+            manager.sync_cycle(target_abs_id="issue-443")
+            self.assertEqual(writes, [1])
+            self.assertAlmostEqual(client.get_ebook_progress_rich(443)["pct"], 0.488417)
+            manager.sync_cycle(target_abs_id="issue-443")
+        self.assertEqual(writes, [1])
+        self.assertEqual(rows[2]["percentage"], 0.0)
+        messages = "\n".join(logs.output)
+        self.assertIn("📊 ABS: 0.0000% -> 48.4490%", messages)
+        self.assertIn("📊 BookOrbit: 0.0000% -> 26.0000%", messages)
+        self.assertIn("BookOrbit: Issue 443 → 48.8% (koreader_xpath=False)", messages)

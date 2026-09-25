@@ -24,6 +24,14 @@ from pathlib import Path
 from collections import OrderedDict
 from src.sync_clients.sync_client_interface import LocatorResult
 from src.utils.cache_paths import safe_cache_path, is_plain_basename
+from src.utils.ebook_dom_map import (
+    INLINE_TEXT_JOINER,
+    content_string_nodes,
+    joined_text,
+    runs_from_nodes,
+    strip_inline_joiner,
+    strip_inline_joiner_with_map,
+)
 from src.utils.logging_utils import get_persistent_condition_logger
 
 logger = logging.getLogger(__name__)
@@ -79,6 +87,17 @@ class EbookParser:
     KOREADER_FRAGMENTING_P_CHILD_TAGS = CRENGINE_FRAGILE_INLINE_TAGS | {
         "mark", "abbr", "cite", "code", "q", "time", "s", "del", "ins"
     }
+    # BeautifulSoup inserts a separator between every text node. That is correct
+    # for block boundaries but corrupts inline markup such as ``<b>T</b>he``.
+    # ``src.utils.ebook_dom_map.joined_text`` keeps one character at inline
+    # joins so existing EPUB coordinate offsets stay stable, using a
+    # non-whitespace marker (see ``INLINE_TEXT_JOINER``'s own docstring) that
+    # this class's own return paths and ``map_quality``'s tokenizer strip
+    # before matching words. Class attribute kept as an alias of the
+    # module-level constant re-exported from ``ebook_dom_map`` (its one true
+    # definition) so existing ``EbookParser.INLINE_TEXT_JOINER`` callers and
+    # tests keep working.
+    INLINE_TEXT_JOINER = INLINE_TEXT_JOINER
 
     def __init__(self, books_dir, epub_cache_dir=None, ollama_client=None):
         self.books_dir = Path(books_dir)
@@ -518,6 +537,37 @@ class EbookParser:
             logger.debug(f"EPUB sanitize failed for '{str_path}': {e}", exc_info=True)
             return None
 
+    @classmethod
+    def _extract_text_from_soup(cls, soup) -> str:
+        """Extract readable text without splitting words at inline tags.
+
+        BeautifulSoup's ``get_text(separator=' ')`` treats every text-node
+        boundary as a word boundary. EPUBs that use bold or other inline tags
+        for bionic reading can therefore turn ``<b>T</b>he`` into ``T he``.
+
+        Delegates entirely to :mod:`src.utils.ebook_dom_map`'s
+        ``content_string_nodes``/``runs_from_nodes``/``joined_text`` -- the
+        exact same node enumeration and inline-join decision
+        ``build_dom_anchor_map`` (the read-along builder's DOM-anchored map)
+        uses, so the two can never drift apart. They used to: a hand-rolled
+        node walker here that didn't match ``content_string_nodes``'s type
+        filtering (e.g. it would surface ``<rt>``/``<rp>`` ruby annotation
+        text that bs4's own ``get_text()`` -- and therefore every existing
+        character offset -- has always excluded) or its own inline-join
+        decision would silently corrupt every downstream xpath/CFI/percentage
+        offset, or raise "DOM anchor mismatch" and abort read-along
+        generation. ``content_string_nodes`` also enumerates via bs4's
+        already-iterative ``.descendants`` rather than a recursive walk, so it
+        does not risk ``RecursionError`` on pathologically deep markup.
+
+        Preserves one output character for every separator bs4's own
+        ``get_text`` would have emitted, so existing character offsets remain
+        stable; see ``INLINE_TEXT_JOINER``'s docstring for when a joiner
+        replaces the usual space.
+        """
+        nodes = content_string_nodes(soup)
+        return joined_text(nodes, runs_from_nodes(nodes))
+
     def extract_text_and_map(self, filepath, progress_callback=None):
         """
         Used for fuzzy matching and general content extraction.
@@ -576,7 +626,7 @@ class EbookParser:
                     continue
                 if item.get_type() == ebooklib.ITEM_DOCUMENT:
                     soup = BeautifulSoup(item.get_content(), 'html.parser')
-                    text = soup.get_text(separator=' ', strip=True)
+                    text = self._extract_text_from_soup(soup)
 
                     start = current_idx
                     length = len(text)
@@ -616,7 +666,7 @@ class EbookParser:
             start = max(0, target_pos - 400)
             end = min(len(full_text), target_pos + 400)
 
-            return full_text[start:end]
+            return full_text[start:end].replace(self.INLINE_TEXT_JOINER, "")
         except Exception as e:
             logger.error(f"❌ Error getting text at percentage: {e}", exc_info=True)
             return None
@@ -720,18 +770,16 @@ class EbookParser:
 
             if not element: return None
 
-            current_offset = 0
+            # The element starts at its first canonical text run. Walking
+            # soup.find_all(string=True) instead counted the <?xml?> declaration
+            # and doctype as text and dropped the separator space between runs.
             found_offset = -1
-            all_strings = soup.find_all(string=True)
-
-            for s in all_strings:
-                if s.parent == element or element in s.parents:
-                    found_offset = current_offset
+            nodes = content_string_nodes(soup)
+            for run in runs_from_nodes(nodes):
+                node = nodes[run.node_index]
+                if node.parent is element or element in node.parents:
+                    found_offset = run.start
                     break
-                text_len = len(s.strip())
-                if text_len == 0:
-                    continue
-                current_offset += text_len
 
             if found_offset == -1:
                 # Fallback
@@ -744,7 +792,7 @@ class EbookParser:
             global_offset = target_item['start'] + found_offset
             start = max(0, global_offset)
             end = min(len(full_text), global_offset + 500)
-            return full_text[start:end]
+            return strip_inline_joiner(full_text[start:end])
 
         except Exception as e:
             logger.error(f"❌ Error resolving locator ID '{fragment_id}' in '{filename}': {e}", exc_info=True)
@@ -807,7 +855,7 @@ class EbookParser:
                 "resolve_href_progression: '%s' href='%s' progression=%.4f -> char %d "
                 "(chapter %d..%d)", filename, href, progression, offset, start, start + char_len,
             )
-            return full_text[offset: min(len(full_text), offset + 500)] or None
+            return strip_inline_joiner(full_text[offset: min(len(full_text), offset + 500)]) or None
 
         except Exception as e:
             logger.error(
@@ -840,7 +888,10 @@ class EbookParser:
         current_char_count = 0
         target_tag = None
 
-        elements = soup.find_all(string=True)
+        # Only the strings extract_text_and_map counts: soup.find_all(string=True)
+        # also returns the <?xml?> declaration and doctype (~40 chars), which
+        # shifted every CFI to an earlier element.
+        elements = content_string_nodes(soup)
         for string in elements:
             text_len = len(string.strip())
             if text_len == 0: continue
@@ -886,7 +937,8 @@ class EbookParser:
         current_char_count = 0
         target_tag = None
 
-        elements = soup.find_all(string=True)
+        # Only the strings extract_text_and_map counts (see _generate_cfi).
+        elements = content_string_nodes(soup)
         for string in elements:
             text_len = len(string.strip())
             if text_len == 0: continue
@@ -1005,33 +1057,55 @@ class EbookParser:
                 return None
             total_len = len(full_text)
 
+            # Exact substring/uniqueness matching below must run against a
+            # joiner-free view of full_text: search_phrase is always
+            # joiner-free (it comes from callers like get_text_at_percentage,
+            # which already strips it), but full_text still has one wherever
+            # the book has an inline (e.g. bionic-reading) word split. Without
+            # this, both `full_text.find(...)` and the count()==1 uniqueness
+            # check below silently fail to match any phrase spanning such a
+            # split, and every sync for that book falls back to the slow
+            # normalized full-book scan (step 2), which has no uniqueness
+            # guarantee. `display_to_raw` converts a match position found in
+            # the joiner-free text back into full_text's own offset space,
+            # which spine_map bounds and xpath/CFI generation assume.
+            if INLINE_TEXT_JOINER in full_text:
+                display_text, display_to_raw = strip_inline_joiner_with_map(full_text)
+            else:
+                display_text, display_to_raw = full_text, None
+
+            def _to_raw_index(display_index: int) -> int:
+                return display_to_raw[display_index] if display_to_raw is not None else display_index
+
             # Global uniqueness check (the anchor logic)
             # Try to find a 10-word sequence that appears EXACTLY once in the book.
             # This prevents jumping to duplicate phrases (e.g., "Chapter 1" in the ToC vs the actual chapter).
             clean_search = " ".join(search_phrase.split())
             words = clean_search.split()
-            
+
             match_index = -1
-            
+
             if len(words) >= 10:
                 N = 10
                 # Scan through the search phrase to find a unique anchor
                 for i in range(len(words) - N + 1):
                     candidate = " ".join(words[i:i+N])
-                    
+
                     # Check if this phrase exists exactly ONCE in the text
-                    if full_text.count(candidate) == 1:
-                        found_idx = full_text.find(candidate)
+                    if display_text.count(candidate) == 1:
+                        found_idx = display_text.find(candidate)
                         if found_idx != -1:
-                            match_index = found_idx
+                            match_index = _to_raw_index(found_idx)
                             logger.info(f"⚓ Found unique text anchor: '{candidate[:30]}...' at index {match_index}")
                             break
-            
+
             # [End of NEW logic] - Continue to existing fallbacks
 
             # 1. Exact match (if anchor logic didn't find anything)
             if match_index == -1:
-                match_index = full_text.find(search_phrase)
+                found_idx = display_text.find(search_phrase)
+                if found_idx != -1:
+                    match_index = _to_raw_index(found_idx)
 
             # 2. Normalized match
             if match_index == -1:
@@ -1594,7 +1668,10 @@ class EbookParser:
             first_non_empty_string = None
             last_non_empty_string = None
 
-            elements = soup.find_all(string=True)
+            # Only the strings extract_text_and_map counts: soup.find_all(string=True)
+            # also returns the <?xml?> declaration and doctype (~40 chars), which
+            # put positions near a paragraph start in the previous paragraph.
+            elements = content_string_nodes(soup)
             for string in elements:
                 # Count lengths exactly like extract_text_and_map's get_text(strip=True)
                 clean_text = string.strip()
@@ -1970,7 +2047,7 @@ class EbookParser:
                 # 3. Return text from the Main Source of Truth (full_text)
                 start = max(0, global_index)
                 end = min(len(full_text), global_index + 600) # Grab enough context
-                return full_text[start:end]
+                return strip_inline_joiner(full_text[start:end])
             
             else:
                 # Fallback: If exact match fails (rare), try the old calculation method
@@ -2002,7 +2079,7 @@ class EbookParser:
                      global_offset = target_item['start'] + local_pos
                      start = max(0, global_offset)
                      end = min(len(full_text), global_offset + 500)
-                     return full_text[start:end]
+                     return strip_inline_joiner(full_text[start:end])
 
                 return None
 
@@ -2417,13 +2494,52 @@ class EbookParser:
             start_pos = max(0, global_offset - context)
             end_pos = min(len(full_text), global_offset + context)
 
-            snippet = full_text[start_pos:end_pos]
+            snippet = strip_inline_joiner(full_text[start_pos:end_pos])
             logger.info(f"Snippet extracted: {snippet[:30]}...")
             return snippet
 
         except Exception as e:
             logger.error(f"❌ Error using epubcfi library for '{cfi}': {e}", exc_info=True)
             return None
+
+    _CANONICAL_EXCLUDED_TAGS = frozenset({"script", "style", "template", "head"})
+
+    def _canonical_offset_of_element(self, root, target) -> Optional[int]:
+        """Local offset in a spine item's canonical text where ``target``'s
+        text begins, or ``None`` if ``target`` is not under ``root``.
+
+        Walks the lxml tree in document order with ``extract_text_and_map``'s
+        rules: each text node stripped and dropped if empty, one space between
+        survivors, and no text from comments, processing instructions or
+        ``<script>``/``<style>``/``<template>``/``<head>`` (the same exclusions
+        ``ebook_dom_map.content_string_nodes`` applies).
+        """
+        count = 0
+        seen_text = False
+
+        def add(value: Optional[str]) -> None:
+            nonlocal count, seen_text
+            stripped = (value or "").strip()
+            if stripped:
+                if seen_text:
+                    count += 1
+                count += len(stripped)
+                seen_text = True
+
+        def walk(element) -> bool:
+            if element is target:
+                return True
+            if isinstance(element.tag, str) and self._local_tag_name(element) not in self._CANONICAL_EXCLUDED_TAGS:
+                add(element.text)
+                for child in element:
+                    if walk(child):
+                        return True
+                    add(child.tail)
+            return False
+
+        if not walk(root):
+            return None
+        return count + 1 if seen_text else 0
 
     def resolve_cfi_to_index(self, filename, cfi) -> Optional[int]:
         """
@@ -2493,15 +2609,22 @@ class EbookParser:
                 soup = BeautifulSoup(item['content'], 'html.parser')
                 chapter_text = soup.get_text(separator=' ', strip=True)
                 element_text = current_element.text_content() if hasattr(current_element, 'text_content') else ""
+                anchor = element_text.strip()[:50] if element_text else ""
 
-                if element_text and len(element_text.strip()) > 5:
-                    element_start = chapter_text.find(element_text.strip()[:50])
-                    if element_start != -1:
+                if len(element_text.strip()) > 5 and chapter_text.count(anchor) == 1:
+                    local_offset = chapter_text.find(anchor) + char_offset
+                else:
+                    # Text too short to anchor (a Calibre "* * *" scene break
+                    # sent readers to the chapter start) or repeated in the
+                    # chapter (the first copy would win): place the element by
+                    # its position in document order instead.
+                    element_start = self._canonical_offset_of_element(tree, current_element)
+                    if element_start is not None:
                         local_offset = element_start + char_offset
+                    elif anchor and len(element_text.strip()) > 5 and anchor in chapter_text:
+                        local_offset = chapter_text.find(anchor) + char_offset
                     else:
                         local_offset = text_count + char_offset
-                else:
-                    local_offset = text_count + char_offset
             else:
                 local_offset = text_count + char_offset
 

@@ -463,3 +463,56 @@ class MarkCompleteKoSyncLocatorTest(unittest.TestCase):
         self.assertEqual(saved.client_name, "kosync")
         self.assertIsNone(saved.xpath)
         self.assertIsNone(saved.cfi)
+
+
+class TestMarkCompleteTellsKoreaderDevices(MarkCompleteRouteTest):
+    """Mark Complete must also mark the book finished for the reader devices.
+
+    This route writes 100% to every client directly and never runs a sync cycle,
+    so the cycle's completion edge -- which normally marks a book finished for
+    KOReader -- never sees it. Pressing this button is the most explicit "I
+    finished this" the bridge has, so it is the worst one to miss.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._prior = os.environ.get('KOREADER_STATUS_SYNC_ENABLED')
+        os.environ['KOREADER_STATUS_SYNC_ENABLED'] = 'true'
+
+    def tearDown(self):
+        if self._prior is None:
+            os.environ.pop('KOREADER_STATUS_SYNC_ENABLED', None)
+        else:
+            os.environ['KOREADER_STATUS_SYNC_ENABLED'] = self._prior
+        super().tearDown()
+
+    def _run(self, payload=None):
+        client = _make_client("Any", sync_types={'audiobook'})
+        app = self._build_test({'Any': client})
+        return _post_json(app, '/api/mark-complete/test-book', payload)
+
+    def test_records_complete_for_the_devices(self):
+        response = self._run()
+        assert response.status_code == 200, response.get_data(as_text=True)
+
+        import src.web_server as ws
+        ws.database_service.record_koreader_status_for_book.assert_called_once()
+        args, kwargs = ws.database_service.record_koreader_status_for_book.call_args
+        assert args[0] == 'test-book'
+        assert kwargs['status'] == 'complete'
+        assert kwargs['device_key'] == 'bridge'
+
+    def test_gate_off_records_nothing(self):
+        os.environ['KOREADER_STATUS_SYNC_ENABLED'] = 'false'
+        self._run()
+
+        import src.web_server as ws
+        ws.database_service.record_koreader_status_for_book.assert_not_called()
+
+    def test_delete_variant_does_not_record(self):
+        """Marking complete AND deleting the mapping means the book is leaving;
+        stamping a status on the way out would outlive the thing it describes."""
+        self._run({'delete': True})
+
+        import src.web_server as ws
+        ws.database_service.record_koreader_status_for_book.assert_not_called()

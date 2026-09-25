@@ -389,3 +389,27 @@ def test_upsert_status_per_branch():
     kwargs = db.upsert_shelf_watch_scan.call_args.kwargs
     assert kwargs.get('status') == 'suggested'
     assert kwargs.get('top_score') == 80.0
+
+
+@patch.dict(os.environ, {
+    'BOOKLORE_SHELF_WATCH_ENABLED': 'true',
+    'BOOKLORE_SHELF_WATCH_NAME': 'Up Next',
+    'BOOKLORE_SHELF_NAME': 'Kobo',
+    'BOOKLORE_SHELF_WATCH_THRESHOLD': '95',
+})
+def test_null_shelf_id_is_skipped_not_stringified():
+    """A shelf entry carrying an explicit "id": null must be skipped like any other
+    missing id. Stringifying it produced the literal "None", which is truthy and
+    sailed through the guard into the source download every scan (finding #4401)."""
+    svc, bl, db, bms, _ = _build_service(
+        suggestions_result={"matches": [_make_audio_match(score=96.0)]},
+        list_books_return=[_make_booklore_book(grimmory_id=None)],
+    )
+
+    stats = svc.process_watch_shelf()
+
+    assert stats['scanned'] == 1
+    assert stats['auto_matched'] == 0
+    bms.create_audio_mapping_from_match.assert_not_called()
+    bms.create_ebook_only_mapping.assert_not_called()
+    bl.move_between_shelves.assert_not_called()

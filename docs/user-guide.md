@@ -16,6 +16,8 @@ It shows:
 - **Show position** beside the progress bar on any book with an ebook, opening a short excerpt of the text where you are currently synced
 - **Author, series, and format filters** with counts, plus a visible total of the books currently shown
 - Annotation sync status when the updated Bridge Sync KOReader plugin is in use
+- A **CTC pill** and a blue **read-along pill** under a book's ratings, marking a book whose
+  alignment came from forced alignment or one that has a finished read-along EPUB
 - Quick access to **Add / Update Book**, **Suggestions**, **Stats**, **Settings**, and **Logs**
 
 If a book is significantly out of sync, the card is highlighted so you can spot it quickly.
@@ -60,7 +62,7 @@ Open **Settings → Sync → Alignment Health** to see alignment quality scores,
 maps that can benefit from rebuilding, and restore the previous map if a remap is not
 an improvement. On a book card, use **Remap alignment** to rebuild the audio-to-ebook
 map without clearing reading progress; **Clear position** remains the action that
-resets progress. A CTC badge marks a book already using the optional CTC backend.
+resets progress. A CTC badge marks a book whose alignment came from forced alignment.
 
 **Honor a Deliberate Rewind** is on by default in Settings → Sync. After you go back in
 one app, keep reading or listening from the new position so the bridge can distinguish
@@ -178,6 +180,62 @@ What syncs:
 - Existing annotations after using **Sweep All Highlights** in the Bridge Sync plugin
 
 Plain KOReader/KOSync clients and older Bridge Sync versions continue syncing reading position, but they do not exchange highlights or notes.
+
+---
+
+## Keeping Multiple KOReader Devices in Step
+
+Two independent features, both needing the **BridgeSync 0.9.6** plugin (or newer) on every
+device involved, keep more than a book's reading *position* in sync across your devices.
+
+### Reading status
+
+**Sync reading status between devices**, on the **Settings -> Integrations -> KOReader /
+KoSync** card, shares a book's KOReader status — reading, finished, or abandoned — across
+your devices. It is **on by default**. A book you start on one device shows as in progress on
+the others, including a book that was delivered to a device but never opened there. It also:
+
+- fills in **in progress** from the reading position the bridge already tracks, once you have
+  read past a 1% floor;
+- marks a book **finished** on your devices whenever the bridge decides it is complete —
+  in BookOrbit, ABS, Grimmory, CWA, or Storyteller — independently of the separate
+  **Propagate Completion** setting in Settings → Sync;
+- clears a book's KOReader status when you **clear its progress**, so a book you are about
+  to re-read does not still show as finished.
+
+A book you deliberately marked finished or abandoned on a device keeps that status — opening
+a book says less than a decision you made about it. When two devices genuinely disagree, the
+one whose status changed most recently wins, and "finished" breaks a same-day tie. Only the
+status shown in the file browser is shared; your reading position is never affected.
+
+### Recently-read History
+
+**Share recently-read books between devices**, on the same card, is **off by default** — it
+changes what KOReader's History means. KOReader only ever writes History for a book you
+opened *on that device*, so a book you read on the Kobo never showed up in the Kindle's
+History, even after its progress and status had synced — and anything built from History,
+like a "Recent" shelf, stayed empty there too. Turning this on files a book you read anywhere
+into History on all your devices as well. It is bounded so a first sync cannot bury your
+existing History: only books whose file is already on that device, nothing read more than 30
+days ago, and at most 25 books per sync.
+
+After either feature updates a device's data, the bridge tells KOReader that book metadata
+changed, so the file browser (and shelf plugins that watch for it) redraw with the new status
+or History on their own, without needing a restart.
+
+### The device you're reading on can win a disagreement
+
+When one book is linked to reader files on more than one device, the furthest-along position
+has always won a sync — which means a device you have not opened in weeks can keep pulling
+you forward on the device you are actually reading, every time it syncs. **When two KOReader
+devices disagree**, under **Settings -> Integrations -> KOReader / KoSync -> Advanced —
+cross-device progress**, can let the device you are reading on win instead — but only once it
+has proved itself with several page turns in a row, moving forward, on that same device. A
+single reading is never enough, so merely opening a stale device still cannot move you.
+
+It ships as **Watch and log only**: the bridge logs the choice it would have made without
+changing anything your readers receive, so you can check the behavior against your own devices
+before switching it to **Let the device you are reading on win**.
 
 ---
 
@@ -360,6 +418,59 @@ Use **Settings -> System -> Advanced -> Storyteller Backfill** to:
 - Rebuild alignment data without rerunning Whisper
 
 This is useful after importing old Storyteller assets or fixing your Storyteller assets mount.
+
+---
+
+## Read-Along EPUBs for BookOrbit
+
+BookBridge can build its own read-along EPUB — an EPUB 3 with word-level narration
+highlighting — from a book's existing audiobook and ebook, and deliver it into BookOrbit.
+Unlike Storyteller Editions, this uses BookBridge's own alignment (forced alignment or
+Whisper/lexical), so no separate Storyteller server is required.
+
+### Requirements
+
+A mapping is eligible once:
+
+- Its **audio source is BookOrbit** (Audiobookshelf and Grimmory audio are not supported for
+  this feature), and
+- it already has an **alignment map** — forced alignment or the standard Whisper/lexical
+  one — from a normal sync or match.
+
+A book that already carries its own read-along narration is refused rather than rebuilt.
+
+### Generating one
+
+Two ways to start a generation job:
+
+1. **At match time.** In **Add / Update Book**, once you pick a **BookOrbit audiobook**, a
+   checkbox appears: *Also generate a read-along EPUB for BookOrbit once this book finishes
+   forging.* Tick it and finish the match (**Create Mapping** or **Match All** — a Storyteller
+   account is not required). Generation starts automatically as soon as the book's alignment
+   finishes.
+2. **From an existing book card.** Open the card's reset menu and choose **Create read-along
+   EPUB**. The button shows live progress by stage while the job runs, and the card's
+   read-along pill appears once it finishes. Use **Remove read-along EPUB** from the same menu
+   to delete a generated one.
+
+Generation preserves the book's original chapter markup and non-breaking whitespace, keeps
+each audio clip within its narrated segment, and refuses to publish an incomplete export
+rather than shipping a book with missing chapters. A failed regeneration leaves the previous
+EPUB in place and does not trigger a library scan. EPUB 2 source books are converted to EPUB 3
+automatically as part of generation.
+
+### Coexistence with BookOrbit's own read-along sync
+
+BookOrbit 3.0 and later can keep a read-along book's audio and text positions in step by
+itself. If BookBridge maps both formats onto the *same* BookOrbit entry, both would be
+writing that book — see **When BookOrbit Syncs Read-Along Books Itself** in the
+[Configuration Guide](configuration.md#bookorbit) and
+[the related troubleshooting entry](troubleshooting.md#a-read-along-book-keeps-shifting-position-or-bookorbit-and-bookbridge-disagree)
+if positions seem to jump around after generating one.
+
+If you regenerate an existing read-along EPUB after upgrading BookBridge, you pick up any
+playback fixes (smaller, per-chapter audio files, corrected highlighting, and so on) that
+shipped after the original file was built.
 
 ---
 

@@ -19,6 +19,7 @@ import zipfile
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 from urllib.parse import unquote, urljoin, urlparse
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
@@ -45,16 +46,23 @@ from src.utils.logging_utils import memory_log_handler, LOG_PATH
 from src.utils.logging_utils import sanitize_log_data
 from src.utils.logging_utils import get_persistent_condition_logger
 from src.services.diagnostics import setup_diagnostics_logging
+from src.services import whats_new
 from src.api.api_clients import ABS_DISABLED_SENTINEL, is_abs_disabled_value
 from src.api.kosync_server import kosync_sync_bp, kosync_admin_bp, init_kosync_server, signal_manifest_rebuild
 from src.api.hardcover_routes import hardcover_bp, init_hardcover_routes
 from src.api.storygraph_routes import storygraph_bp, init_storygraph_routes
 from src.api.bookfusion_upload_client import extract_epub_metadata, _S3_TIMEOUT_LARGE
 from src.version import APP_VERSION, get_update_status
-from src.db.models import State
+from src.db.models import State, JOB_KIND_ALIGNMENT, JOB_KIND_READALONG
 from src.sync_clients.sync_client_interface import LocatorResult, UpdateProgressRequest
 from src.services.audio_source_adapters import AudioResult, ABSAudioSourceAdapter, BookLoreAudioSourceAdapter, BookOrbitAudioSourceAdapter
 from src.utils.storyteller_transcript import StorytellerTranscript
+from src.services.readalong_delivery import (
+    deliver_readalong_epub,
+    resolve_audiobook_folder,
+    remove_readalong_epub as _remove_readalong_epub_file,
+    _readalong_filename,
+)
 from src.utils.kosync_headers import kosync_request_kwargs
 from src.utils.series_metadata import (
     extract_series_from_abs_metadata as _series_from_abs_metadata,
@@ -89,6 +97,9 @@ SUGGESTIONS_SCAN_JOB_TTL_SECONDS = 3600
 SUGGESTIONS_STATE_STORE = {}
 SUGGESTIONS_STATE_LOCK = threading.Lock()
 SUGGESTIONS_STATE_TTL_SECONDS = 86400
+# Per-user credential key (not a user-editable setting) recording the last
+# APP_VERSION the "what's new" banner/page was shown/dismissed for.
+WHATS_NEW_SEEN_KEY = "WHATS_NEW_SEEN_VERSION"
 SUGGESTIONS_CACHE_FILE_NAME = "suggestions_scan_cache.json"
 SUGGESTIONS_CACHE_LOCK = threading.Lock()
 # Batch-match queue lives on disk (under DATA_DIR) instead of the Flask session cookie:
@@ -96,6 +107,23 @@ SUGGESTIONS_CACHE_LOCK = threading.Lock()
 # unbounded, survives container rebuilds, and is shared across the admin's tabs.
 MATCH_QUEUE_FILE_NAME = "match_queue.json"
 MATCH_QUEUE_LOCK = threading.RLock()
+_READALONG_GENERATION_LOCK = threading.Lock()
+_ACTIVE_READALONG_GENERATIONS = set()
+
+
+def _claim_readalong_generation(abs_id: str) -> bool:
+    """Reserve one in-process read-along generation for ``abs_id``."""
+    with _READALONG_GENERATION_LOCK:
+        if abs_id in _ACTIVE_READALONG_GENERATIONS:
+            return False
+        _ACTIVE_READALONG_GENERATIONS.add(abs_id)
+        return True
+
+
+def _release_readalong_generation(abs_id: str) -> None:
+    """Release the in-process read-along generation reservation."""
+    with _READALONG_GENERATION_LOCK:
+        _ACTIVE_READALONG_GENERATIONS.discard(abs_id)
 STATS_CACHE = {}
 STATS_CACHE_LOCK = threading.Lock()
 STATS_CACHE_TTL_SECONDS = 60
@@ -352,6 +380,17 @@ def setup_dependencies(app, test_container=None):
 
     # Initialize manager and services
     manager = container.sync_manager()
+
+    # Forge workers run in their own module and thread. Inject the live
+    # read-along worker/admission hooks so the production ``__main__`` entry
+    # point never imports a second, uninitialized ``src.web_server`` module.
+    forge = container.forge_service()
+    forge.readalong_epub_worker = _readalong_epub_worker
+    forge.readalong_generation_admitter = _claim_readalong_generation
+    forge.readalong_generation_releaser = _release_readalong_generation
+    # The background alignment job (Match All's Storyteller-free path) hands a
+    # finished book to the same read-along dispatcher the Forge path uses.
+    manager.readalong_intent_dispatcher = forge.generate_readalong_if_requested
 
     # Wire the SuggestionsService factory into the shelf-watch singleton.
     # web_server.py is the `__main__` entry point; if shelf_watch_service tried
@@ -2116,10 +2155,6 @@ def get_kosync_id_for_ebook(ebook_filename, booklore_id=None, original_filename=
                          if str(res.get('id')) == cwa_id:
                              target = res
                              break
-                     
-                     # If no exact ID match, maybe it was the only result
-                     if not target and len(results) == 1:
-                         target = results[0]
 
                      # Priority 2: Use direct download URL from search if available
                      if target and target.get('download_url'):
@@ -2127,7 +2162,10 @@ def get_kosync_id_for_ebook(ebook_filename, booklore_id=None, original_filename=
                      else:
                          # Priority 3: Fallback to get_book_by_id only if search didn't provide a URL
                          # This may crash server on metadata page, but includes a blind URL fallback
-                         logger.debug(f"🔍 Search did not return a usable result, trying direct ID lookup")
+                         if results and not target:
+                             logger.info(f"🔍 CWA search for ID '{cwa_id}' returned {len(results)} result(s), none with that ID — looking it up by ID")
+                         else:
+                             logger.debug(f"🔍 Search did not return a usable result, trying direct ID lookup")
                          target = cwa_client.get_book_by_id(cwa_id)
 
                      if target and target.get('download_url'):
@@ -4145,6 +4183,8 @@ def settings():
             'KOSYNC_HASH_RECONCILE_ENABLED',
             'KOSYNC_XPATH_ORDER_ENABLED',
             'KOREADER_ANNOTATION_SYNC',
+            'KOREADER_STATUS_SYNC_ENABLED',
+            'KOREADER_SYNC_READ_HISTORY',
             'SYNC_FRESHNESS_GUARDS',
             'SYNC_TRUST_CORROBORATED_REWIND',
             'SYNC_COMPLETION_PROPAGATION',
@@ -5373,7 +5413,7 @@ def _build_dashboard_mapping(
     }
 
     if book.status in ("processing", "forging"):
-        job = database_service.get_latest_job(book.abs_id)
+        job = database_service.get_latest_job(book.abs_id, kind=JOB_KIND_ALIGNMENT)
         if job:
             mapping["job_progress"] = round((job.progress or 0.0) * 100, 1)
             mapping["job_last_error"] = job.last_error
@@ -5588,6 +5628,8 @@ def _build_dashboard_mappings(
         bookorbit_authors = _prefetch_bookorbit_authors(books, integrations)
 
     ctc_aligned_book_ids = database_service.get_ctc_aligned_book_ids()
+    readalong_alignment_book_ids = database_service.get_readalong_alignment_book_ids()
+    readalong_ready_book_ids = database_service.get_readalong_ready_book_ids()
     mappings = []
     total_duration = 0
     total_listened = 0
@@ -5606,6 +5648,33 @@ def _build_dashboard_mappings(
             bookorbit_authors=bookorbit_authors,
         )
         mapping["ctc_aligned"] = book.abs_id in ctc_aligned_book_ids
+        mapping["readalong_ready"] = book.abs_id in readalong_ready_book_ids
+
+        # Read-along generation eligibility (Phase 6a). Cheap, locally-computable
+        # conditions only -- whether BookOrbit can actually resolve the audio
+        # entry's real track files needs a live API call (resolve_audiobook_folder)
+        # and is not affordable per book on every dashboard render, so it is left
+        # to the action's own handler; this only surfaces what is knowable from
+        # already-loaded rows, mirroring the ctc_aligned badge above.
+        audio_ok = (
+            getattr(book, "audio_source", None) == "BookOrbit"
+            and getattr(book, "sync_mode", "audiobook") != "ebook_only"
+        )
+        mapping["readalong_audio_ok"] = audio_ok
+        if not audio_ok:
+            mapping["readalong_eligible"] = False
+            mapping["readalong_ineligible_reason"] = (
+                "This mapping has no audiobook to generate a read-along from."
+                if getattr(book, "sync_mode", "audiobook") == "ebook_only"
+                else "Read-along generation requires a BookOrbit audio source."
+            )
+        elif book.abs_id not in readalong_alignment_book_ids:
+            mapping["readalong_eligible"] = False
+            mapping["readalong_ineligible_reason"] = "This book has no CTC or lexical alignment map yet."
+        else:
+            mapping["readalong_eligible"] = True
+            mapping["readalong_ineligible_reason"] = None
+
         mappings.append(mapping)
 
         duration = mapping.get("duration", 0)
@@ -5766,6 +5835,68 @@ def audiobook_matches_search(ab, search_term):
 
     return False
 
+def _build_whats_new_context(user) -> Optional[dict]:
+    """Compute the "what's new after upgrade" banner context for the Library
+    page, or None to show nothing. Never raises into the page: any failure
+    is logged at debug and treated as "no banner".
+
+    When no seen-version has been stored yet for the user and this looks
+    like a brand-new account (created by this same process), the current
+    version is silently stored as a baseline instead of announcing it.
+    """
+    if user is None:
+        return None
+    try:
+        stored = database_service.get_user_credentials(user.id).get(WHATS_NEW_SEEN_KEY)
+        decision = whats_new.should_show_banner(
+            app_version=APP_VERSION,
+            stored_value=stored,
+            user_created_at=getattr(user, "created_at", None),
+            process_started_at=whats_new.PROCESS_STARTED_AT,
+        )
+        if decision == "store_current":
+            database_service.set_user_credential(user.id, WHATS_NEW_SEEN_KEY, APP_VERSION)
+            return None
+        if decision != "show":
+            return None
+        return {
+            "version": APP_VERSION,
+            "action_items": whats_new.get_action_required_items(),
+        }
+    except Exception as e:
+        logger.debug(f"Could not compute whats-new banner state: {e}", exc_info=True)
+        return None
+
+
+def whats_new_page():
+    """GET /whats-new: renders RELEASE_NOTES.md and marks the running
+    version seen for the logged-in user."""
+    user = current_user()
+    if user is not None:
+        try:
+            database_service.set_user_credential(user.id, WHATS_NEW_SEEN_KEY, APP_VERSION)
+        except Exception as e:
+            logger.debug(f"Could not record whats-new seen version for user {user.id}: {e}", exc_info=True)
+    return render_template(
+        'whats_new.html',
+        app_version=APP_VERSION,
+        notes_html=whats_new.get_release_notes_html(),
+        action_items=whats_new.get_action_required_items(),
+    )
+
+
+def whats_new_dismiss():
+    """POST /whats-new/dismiss: marks the running version seen for the
+    logged-in user (banner "x" dismiss)."""
+    user = current_user()
+    if user is not None:
+        try:
+            database_service.set_user_credential(user.id, WHATS_NEW_SEEN_KEY, APP_VERSION)
+        except Exception as e:
+            logger.debug(f"Could not record whats-new dismiss for user {user.id}: {e}", exc_info=True)
+    return jsonify({"ok": True})
+
+
 # ---------------- ROUTES ----------------
 def index():
     """Dashboard - loads books and progress from database service"""
@@ -5799,6 +5930,7 @@ def index():
     grouped_mappings = _group_dashboard_mappings_by_series(mappings)
 
     latest_version, update_available = get_update_status()
+    whats_new_ctx = _build_whats_new_context(user)
 
     show_diagnostics_modal = (
         not env_truthy('DIAGNOSTICS_PROMPTED')
@@ -5816,7 +5948,8 @@ def index():
         app_version=APP_VERSION,
         update_available=update_available,
         latest_version=latest_version,
-        show_diagnostics_modal=show_diagnostics_modal
+        show_diagnostics_modal=show_diagnostics_modal,
+        whats_new=whats_new_ctx
     )
 
 
@@ -6868,6 +7001,29 @@ def _create_audio_only_mapping_from_queue_item(item):
     return saved_book if not err_msg else None
 
 
+def _record_readalong_intent_for_match(abs_id: str) -> None:
+    """Record "Also generate a read-along EPUB" for a Match All (non-forge) book.
+
+    A book queued for alignment gets it consumed by the background job when its
+    alignment completes (``SyncManager._dispatch_readalong_intent``). A re-match
+    of a book whose alignment still applies stays 'active' and never re-runs that
+    job, so it is dispatched here instead; the dispatcher consumes the intent
+    exactly once and skips a book whose alignment is not eligible.
+    """
+    if not database_service.set_readalong_epub_requested(abs_id, True):
+        return
+    book = database_service.get_book(abs_id)
+    if book is None or getattr(book, "status", None) != 'active':
+        return
+    try:
+        container.forge_service().generate_readalong_if_requested(book)
+    except Exception as e:
+        logger.warning(
+            "Read-along EPUB: could not dispatch generation for re-matched '%s': %s",
+            abs_id, e, exc_info=True,
+        )
+
+
 def _record_forge_match_job(abs_id: str, progress: float = 0.0, last_error: str = None):
     """Persist Forge & Match wait state so it survives refreshes and restarts."""
     if not abs_id:
@@ -7067,6 +7223,8 @@ def _process_batch_queue(queue_items):
             elif saved_book:
                 _claim_book_for_user_id(get_current_user_id(), saved_book.abs_id)
                 _complete_shelf_watch_approval(shelf_watch_meta, remove_only=True)
+                if audio_source == 'BookOrbit' and item.get('readalong_epub_requested'):
+                    _record_readalong_intent_for_match(saved_book.abs_id)
             continue
 
         ebook_filename = item['ebook_filename']
@@ -7458,6 +7616,14 @@ def _process_forge_match_queue(queue_items):
             )
             database_service.save_book(book)
             _claim_book_for_user_id(get_current_user_id(), book.abs_id)
+            # Phase 6b: read-along generation needs a finished alignment map, which
+            # doesn't exist until this forge completes, so only the intent is
+            # recorded here -- ForgeService._maybe_generate_readalong_epub consumes
+            # it from the post-forge completion hook. BookOrbit-audio only (the
+            # queue item is already gated to that; re-check here too since this
+            # branch also covers BookLore).
+            if audio_source == 'BookOrbit' and item.get('readalong_epub_requested'):
+                database_service.set_readalong_epub_requested(forge_id, True)
             _record_forge_match_job(forge_id, progress=0.02, last_error="Queued Forge & Match")
 
             container.forge_service().start_auto_forge_match(
@@ -7558,6 +7724,15 @@ def _queue_item_from_match_form(clients) -> "dict | None":
     audio_only = (request.form.get('audio_only') or '').strip().lower() in {
         'true', '1', 'yes', 'on'
     }
+    # Opt-in intent, recorded per queue item. Only meaningful for a
+    # BookOrbit-audio item; honoured by both
+    # Forge & Match and Match All (_record_readalong_intent_for_match) -- the
+    # template only offers the control for a BookOrbit audiobook selection, but
+    # the checkbox itself is a plain form
+    # field, so re-check the value tolerantly (both a bare "on" and "true").
+    readalong_epub_requested = (
+        request.form.get('readalong_epub_requested') or ''
+    ).strip().lower() in {'true', '1', 'yes', 'on'}
 
     bridge_key = None
     if audio_source == 'ABS' and audio_source_id:
@@ -7625,6 +7800,7 @@ def _queue_item_from_match_form(clients) -> "dict | None":
         'ebook_source_path': ebook_source_path,
         'storyteller_uuid': storyteller_uuid,
         'audio_only': audio_only and not (ebook_filename or storyteller_uuid),
+        'readalong_epub_requested': readalong_epub_requested and audio_source == 'BookOrbit',
     }
 
 
@@ -9407,6 +9583,333 @@ def remap_alignment(abs_id):
     return jsonify({"success": True, "backend": target})
 
 
+# Human-readable labels for the `Job.stage` values `readalong_builder.py` /
+# `readalong_delivery.py` report via the progress callback below. Falls back
+# to the raw stage string (or "Working") for anything not in this map --
+# never an error, since a future stage this map hasn't been updated for
+# should still show *something* rather than break the status poll.
+_READALONG_STAGE_LABELS = {
+    "queued": "Queued",
+    "resolving_audio": "Resolving audio",
+    "converting_epub": "Converting EPUB 2 to EPUB 3",
+    "parsing_epub": "Parsing EPUB",
+    "transcoding_audio": "Transcoding audio",
+    "building_overlays": "Building overlays",
+    "packaging": "Packaging",
+    "delivering": "Delivering to BookOrbit",
+}
+
+
+def _readalong_stage_label(stage: Optional[str]) -> str:
+    """Human-readable label for a read-along job's raw ``Job.stage`` value.
+
+    Anything that is not a non-empty string (``None`` -- no stage recorded
+    yet, or a pre-migration row) falls back to "Working" rather than raising
+    or showing a blank/placeholder value in the UI.
+    """
+    if not isinstance(stage, str) or not stage:
+        return "Working"
+    return _READALONG_STAGE_LABELS.get(stage, stage)
+
+
+def _readalong_epub_worker(abs_id: str, job_id: Optional[int] = None) -> None:
+    """Background worker: generate (Phases 1-4) and deliver (Phase 5) a
+    read-along EPUB for one book.
+
+    Runs off the request thread via `_spawn_user_background`, which has
+    already rebound the triggering user's contextvars before calling this --
+    BookOrbit is configured per user, and a bare `threading.Thread` would
+    silently resolve the admin/global client instead (CLAUDE.md failure mode
+    #5). Progress/outcome are persisted through the existing `Job` model (the
+    same mechanism `_record_forge_match_job` uses) so
+    `/api/readalong-epub/<abs_id>/status` can report the real result even
+    after the triggering request has long since returned.
+
+    Never touches `book.ebook_filename` / `book.original_ebook_filename` --
+    `deliver_readalong_epub` itself is the one place that would, and it does
+    not (see its own docstring).
+
+    **Stage progress**: `deliver_readalong_epub`/`build_readalong_epub` call
+    back into `_report_progress` below at each real stage transition
+    (resolving the audio entry, converting EPUB 2 -> 3, parsing, the
+    dominant ffmpeg transcode, building overlays, packaging, delivering) so
+    `/status` can show real signal instead of a static "generating" message
+    for however many minutes a long book takes. A failed progress *write* is
+    logged and swallowed here (and
+    again, defensively, inside the callback chain itself via
+    `readalong_builder._safe_progress`) -- it must never be the reason a
+    book fails to generate.
+
+    ``job_id`` binds every status write to this worker's own row. It is
+    optional because Forge records the row on a best-effort basis; when row
+    creation fails, status writes are skipped rather than guessed by recency.
+    """
+    def _update_job(**kwargs) -> None:
+        if job_id is None:
+            return
+        try:
+            database_service.update_job_by_id(job_id, **kwargs)
+        except Exception as e:
+            logger.warning(
+                "Could not record read-along job state for '%s' (job_id=%s, %s): %s",
+                sanitize_log_data(abs_id), job_id, kwargs, e, exc_info=True,
+            )
+
+    def _report_progress(stage: str, fraction: float) -> None:
+        _update_job(progress=fraction, stage=stage)
+
+    try:
+        book = database_service.get_book(abs_id)
+        if not book:
+            _update_job(last_error="Book no longer exists")
+            return
+
+        alignment_service = getattr(manager, "alignment_service", None) if manager else None
+        if alignment_service is None:
+            _update_job(last_error="Alignment service unavailable")
+            return
+
+        clients = uc()
+        ebook_sync_client = clients.sync_clients.get("BookOrbit")
+        audio_sync_client = clients.sync_clients.get("BookOrbitAudio")
+        if audio_sync_client is None:
+            _update_job(last_error="BookOrbit audio sync is not available")
+            return
+
+        result = deliver_readalong_epub(
+            parser=container.ebook_parser(),
+            alignment_service=alignment_service,
+            bookorbit_client=clients.bookorbit_client,
+            ebook_sync_client=ebook_sync_client,
+            audio_sync_client=audio_sync_client,
+            book=book,
+            progress_callback=_report_progress,
+        )
+        if result is None:
+            _update_job(
+                last_error="Read-along generation was refused -- see server logs for the exact reason.",
+            )
+            return
+
+        if not result.confirmed:
+            _update_job(
+                progress=1.0,
+                last_error=(
+                    "Generated and delivered, but BookOrbit has not confirmed it "
+                    f"enabled (last status: {result.read_aloud_sync})."
+                ),
+            )
+            logger.warning(
+                "⚠️ Read-along EPUB delivered for '%s' but not confirmed enabled",
+                sanitize_log_data(abs_id),
+            )
+            return
+
+        _update_job(progress=1.0, last_error=None)
+        logger.info(
+            "📖 Read-along EPUB ready for %s", sanitize_log_data(book.abs_title or abs_id)
+        )
+    except Exception as e:
+        logger.error(
+            "❌ Read-along generation failed for '%s': %s", sanitize_log_data(abs_id), e, exc_info=True,
+        )
+        _update_job(last_error=f"Unexpected error: {e}")
+    finally:
+        # Manual and post-forge requests share this process-wide reservation.
+        # The post-forge wrapper releases only when it cannot hand work here.
+        _release_readalong_generation(abs_id)
+
+
+def generate_readalong_epub(abs_id: str):
+    """Queue background generation + delivery of a read-along EPUB for `abs_id`.
+
+    Async: transcode + repackage takes minutes, so this
+    returns immediately once eligibility is confirmed and the real work runs
+    on a user-scoped background thread. Eligibility mirrors what
+    `deliver_readalong_epub`/`build_readalong_epub` actually require that is
+    cheap to check up front (sync mode, audio source, alignment method);
+    resolvability of the live BookOrbit audio entry itself can only be
+    confirmed by the worker's own call to `resolve_audiobook_folder`.
+    """
+    book = database_service.get_book(abs_id)
+    if not book:
+        return jsonify({"success": False, "error": "Book not found"}), 404
+
+    user = current_user()
+    if not _user_may_modify_book(user, abs_id):
+        return _forbidden_book_response(json_response=True)
+
+    if getattr(book, "sync_mode", "audiobook") == "ebook_only":
+        return jsonify({
+            "success": False,
+            "error": "This mapping has no audiobook to generate a read-along from.",
+        }), 400
+
+    if getattr(book, "audio_source", None) != "BookOrbit":
+        return jsonify({
+            "success": False,
+            "error": "Read-along generation requires a BookOrbit audio source.",
+        }), 400
+
+    align_method = database_service.get_alignment_method(abs_id)
+    if (align_method or "") not in ("ctc", "lexical", "lexical_timed"):
+        return jsonify({
+            "success": False,
+            "error": "This book has no CTC or lexical alignment map yet.",
+        }), 400
+
+    # Admission is process-wide so manual requests and post-forge hooks cannot
+    # start two workers for the same book. Persisted incomplete rows are only a
+    # status record: after a restart there is no live worker behind one, so it
+    # must not block a retry.
+    if not _claim_readalong_generation(abs_id):
+        return jsonify({
+            "success": False,
+            "error": "Read-along generation is already in progress for this book.",
+        }), 409
+
+    from src.db.models import Job
+    job = None
+    try:
+        job = database_service.save_job(
+            Job(
+                abs_id=abs_id, last_attempt=time.time(), retry_count=0, progress=0.0, last_error=None,
+                kind=JOB_KIND_READALONG, stage="queued",
+            )
+        )
+        _spawn_user_background(
+            _readalong_epub_worker, abs_id, job.id, label=f"readalong-epub-{abs_id}",
+        )
+    except Exception as e:
+        if job is not None and getattr(job, "id", None) is not None:
+            try:
+                database_service.update_job_by_id(
+                    job.id, last_error=f"Read-along generation failed to start: {e}",
+                )
+            except Exception as update_error:
+                logger.debug("Read-along: could not record start failure for '%s': %s", abs_id, update_error)
+        _release_readalong_generation(abs_id)
+        logger.error(
+            "❌ Could not queue read-along generation for '%s': %s",
+            sanitize_log_data(abs_id), e, exc_info=True,
+        )
+        return jsonify({"success": False, "error": "Could not queue read-along generation."}), 500
+
+    logger.info(
+        "📖 Read-along EPUB generation queued for %s", sanitize_log_data(book.abs_title or abs_id)
+    )
+    return jsonify({"success": True, "status": "queued"})
+
+
+def readalong_epub_status(abs_id: str):
+    """Poll the outcome of the most recent read-along generation job for `abs_id`.
+
+    Reads the `Job` row `generate_readalong_epub` created/updates, scoped to
+    `kind=JOB_KIND_READALONG` -- the `jobs` table also carries Forge & Match
+    rows (`_record_forge_match_job`) and alignment-repair rows for the same
+    `abs_id`, and without the kind filter a job from one of those flows
+    running on the same book at the same time could be newer and would be
+    read here as if it were the read-along job's own status.
+
+    Alongside the pre-existing `state` (idle/running/done/failed) contract,
+    also surfaces `stage` (the raw `Job.stage` key, e.g. 'transcoding_audio'),
+    `stage_label` (its human-readable form), and `percent` (0-100, from
+    `Job.progress`) so the dashboard poller can show real signal for a
+    multi-minute build instead of a static "generating" message. These are
+    additive -- every pre-existing key/shape is unchanged.
+    """
+    book = database_service.get_book(abs_id)
+    if not book:
+        return jsonify({"success": False, "error": "Book not found"}), 404
+
+    user = current_user()
+    if not _user_may_modify_book(user, abs_id):
+        return _forbidden_book_response(json_response=True)
+
+    job = database_service.get_latest_job(abs_id, kind=JOB_KIND_READALONG)
+    if job is None:
+        return jsonify({"success": True, "state": "idle"})
+
+    # Defensive against non-string/non-numeric attributes (e.g. a bare
+    # unittest.mock.Mock() in a test that only set progress/last_error) --
+    # never let a malformed/legacy row break JSON serialization.
+    raw_stage = getattr(job, "stage", None)
+    stage = raw_stage if isinstance(raw_stage, str) and raw_stage else None
+    stage_label = _readalong_stage_label(stage)
+    raw_progress = getattr(job, "progress", None)
+    progress_fraction = raw_progress if isinstance(raw_progress, (int, float)) else 0.0
+    percent = int(round(max(0.0, min(1.0, progress_fraction)) * 100))
+
+    if job.progress and job.progress >= 1.0:
+        payload = {
+            "success": True, "state": "done",
+            "stage": stage, "stage_label": stage_label, "percent": percent,
+        }
+        if job.last_error:
+            payload["warning"] = job.last_error
+        return jsonify(payload)
+    if job.last_error:
+        return jsonify({
+            "success": True, "state": "failed", "error": job.last_error,
+            "stage": stage, "stage_label": stage_label, "percent": percent,
+        })
+    return jsonify({
+        "success": True, "state": "running",
+        "stage": stage, "stage_label": stage_label, "percent": percent,
+    })
+
+
+def remove_readalong_epub_route(abs_id: str):
+    """Remove a previously-delivered read-along EPUB from BookOrbit and disk.
+
+    Synchronous, unlike generation: this is a single BookOrbit delete call plus
+    a local `unlink`, not a transcode/repackage, so it does not need a
+    background job. Resolution mirrors `deliver_readalong_epub`'s own
+    (`resolve_bookorbit_book_id` -> `resolve_audiobook_folder` ->
+    `_readalong_filename`) so the computed path is exactly the one delivery
+    would have written to; every resolution failure is reported as "nothing to
+    remove" rather than an error, since there is nothing this action could
+    have undone.
+    """
+    book = database_service.get_book(abs_id)
+    if not book:
+        return jsonify({"success": False, "error": "Book not found"}), 404
+
+    user = current_user()
+    if not _user_may_modify_book(user, abs_id):
+        return _forbidden_book_response(json_response=True)
+
+    if getattr(book, "audio_source", None) != "BookOrbit":
+        return jsonify({"success": True, "removed": False, "message": "No BookOrbit audio entry for this book."})
+
+    clients = uc()
+    audio_sync_client = clients.sync_clients.get("BookOrbitAudio")
+    audio_book_id = audio_sync_client.resolve_bookorbit_book_id(book) if audio_sync_client else None
+    if audio_book_id is None:
+        return jsonify({"success": True, "removed": False, "message": "No resolvable BookOrbit audio entry for this book."})
+
+    resolved = resolve_audiobook_folder(clients.bookorbit_client, audio_book_id)
+    if resolved is None:
+        return jsonify({"success": True, "removed": False, "message": "Could not resolve the BookOrbit audio folder."})
+
+    epub_filename = getattr(book, "original_ebook_filename", None) or getattr(book, "ebook_filename", None)
+    if not epub_filename:
+        return jsonify({"success": True, "removed": False, "message": "No source EPUB on file."})
+    try:
+        epub_path = container.ebook_parser().resolve_book_path(epub_filename)
+    except FileNotFoundError:
+        return jsonify({"success": True, "removed": False, "message": "Source EPUB not found on disk."})
+
+    output_path = resolved.folder / _readalong_filename(Path(epub_path))
+    ok = _remove_readalong_epub_file(clients.bookorbit_client, audio_book_id, output_path)
+    if ok:
+        logger.info("🗑️ Removed read-along EPUB for %s", sanitize_log_data(book.abs_title or abs_id))
+        # The dashboard badge and the status poll read the latest read-along job;
+        # a removed read-along must stop showing as ready.
+        database_service.delete_jobs_for_book(abs_id, kind=JOB_KIND_READALONG)
+        return jsonify({"success": True, "removed": True})
+    return jsonify({"success": False, "error": "Could not fully remove the read-along EPUB; see server logs."}), 500
+
 
 def sync_now(abs_id):
     book = database_service.get_book(abs_id)
@@ -9504,6 +10007,30 @@ def mark_complete(abs_id):
                 cfi=updated_state.get('cfi'),
             )
             database_service.save_state(state)
+
+    # Tell the reader devices too. This path writes 100% to every client directly
+    # and never runs a sync cycle, so the cycle's completion edge -- which is what
+    # normally marks a book finished for KOReader -- never sees it. Pressing this
+    # button is the most explicit "I finished this" the bridge has, so it would be
+    # the worst one to miss.
+    if not perform_delete and env_truthy('KOREADER_STATUS_SYNC_ENABLED', 'true'):
+        try:
+            written = database_service.record_koreader_status_for_book(
+                abs_id,
+                status='complete',
+                device_key='bridge',
+                user_id=(user.id if user else None),
+            )
+            if written:
+                logger.info(
+                    f"🏁 '{abs_id}' marked finished for KOReader "
+                    f"({written} document hash(es), via mark-complete)"
+                )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Could not mark '{sanitize_log_data(abs_id)}' finished for KOReader: {e}",
+                exc_info=True,
+            )
 
     if perform_delete:
         _delete_or_unlink_book(user, abs_id, book)
@@ -10501,6 +11028,7 @@ def _build_dashboard_progress_rows(books, all_states):
     (issue #412)."""
     states_by_book = _group_dashboard_states_by_book(all_states)
     ctc_aligned_book_ids = database_service.get_ctc_aligned_book_ids()
+    readalong_ready_book_ids = database_service.get_readalong_ready_book_ids()
     rows = []
 
     for book in books or []:
@@ -10525,6 +11053,7 @@ def _build_dashboard_progress_rows(books, all_states):
         rows.append({
             "abs_id": abs_id,
             "ctc_aligned": abs_id in ctc_aligned_book_ids,
+            "readalong_ready": abs_id in readalong_ready_book_ids,
             "unified_progress": min(max_progress, 100.0),
             "last_sync": _format_dashboard_last_sync(latest_update_time),
             "last_sync_unix": latest_update_time,
@@ -12762,6 +13291,8 @@ def create_app(test_container=None):
     app.add_url_rule('/api/admin/users/<int:user_id>/bookfusion/device/start', 'admin_user_bookfusion_device_start', admin_user_bookfusion_device_start, methods=['POST'])
     app.add_url_rule('/api/admin/users/<int:user_id>/bookfusion/device/poll', 'admin_user_bookfusion_device_poll', admin_user_bookfusion_device_poll, methods=['POST'])
     app.add_url_rule('/', 'index', index)
+    app.add_url_rule('/whats-new', 'whats_new_page', whats_new_page, methods=['GET'])
+    app.add_url_rule('/whats-new/dismiss', 'whats_new_dismiss', whats_new_dismiss, methods=['POST'])
     app.add_url_rule('/shelfmark', 'shelfmark', shelfmark)
     app.add_url_rule('/forge', 'forge', forge)
     app.add_url_rule('/book-linker', 'book_linker_legacy', _legacy_book_linker_redirect)
@@ -12773,6 +13304,9 @@ def create_app(test_container=None):
     app.add_url_rule('/delete/<abs_id>', 'delete_mapping', delete_mapping, methods=['POST'])
     app.add_url_rule('/clear-progress/<abs_id>', 'clear_progress', clear_progress, methods=['POST'])
     app.add_url_rule('/api/remap-alignment/<abs_id>', 'remap_alignment', remap_alignment, methods=['POST'])
+    app.add_url_rule('/api/readalong-epub/<abs_id>', 'generate_readalong_epub', generate_readalong_epub, methods=['POST'])
+    app.add_url_rule('/api/readalong-epub/<abs_id>/status', 'readalong_epub_status', readalong_epub_status, methods=['GET'])
+    app.add_url_rule('/api/readalong-epub/<abs_id>/remove', 'remove_readalong_epub_route', remove_readalong_epub_route, methods=['POST'])
     app.add_url_rule('/api/sync-now/<abs_id>', 'sync_now', sync_now, methods=['POST'])
     app.add_url_rule('/api/mark-complete/<abs_id>', 'mark_complete', mark_complete, methods=['POST'])
     app.add_url_rule('/api/me/kosync-documents', 'api_me_kosync_documents', api_me_kosync_documents, methods=['GET'])

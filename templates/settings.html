@@ -870,6 +870,28 @@
                             (BridgeSync plugin required on each device). Deletions and note edits propagate too.</div>
                     </div>
                     <div class="checkbox-wrapper full-width">
+                        <input type="checkbox" id="koreader_status_sync" name="KOREADER_STATUS_SYNC_ENABLED" {% if
+                            get_bool('KOREADER_STATUS_SYNC_ENABLED') %}checked{% endif %}>
+                        <label for="koreader_status_sync">Sync reading status between devices</label>
+                        <div class="help-text">Share each book's KOReader status (reading / finished / abandoned)
+                            across your devices, so a book you start on one shows as in progress on the others
+                            (BridgeSync plugin required on each device). Reading <em>position</em> is unaffected —
+                            only the status shown in the file browser is shared. When two devices disagree, the one
+                            whose status changed most recently wins, and "finished" breaks a same-day tie.</div>
+                    </div>
+                    <div class="checkbox-wrapper full-width">
+                        <input type="checkbox" id="koreader_sync_read_history" name="KOREADER_SYNC_READ_HISTORY" {% if
+                            get_bool('KOREADER_SYNC_READ_HISTORY') %}checked{% endif %}>
+                        <label for="koreader_sync_read_history">Share recently-read books between devices</label>
+                        <div class="help-text">A book you read on one device also appears in KOReader's History on
+                            your others, so views built from it — such as a "Recent" shelf — look the same
+                            everywhere. Without this, History stays strictly per-device: it records only books you
+                            opened <em>on that device</em>, so a book read elsewhere never shows up there even when
+                            its progress and status have synced. Only books whose file is already on the device are
+                            added, nothing read more than 30 days ago, and at most 25 per sync so a first run cannot
+                            bury your existing history.</div>
+                    </div>
+                    <div class="checkbox-wrapper full-width">
                         <input type="checkbox" id="kosync_pct" name="KOSYNC_USE_PERCENTAGE_FROM_SERVER" {% if
                             get_bool('KOSYNC_USE_PERCENTAGE_FROM_SERVER') %}checked{% endif %}>
                         <label for="kosync_pct">Use Percentage from Server (Ignore Text Matching)</label>
@@ -918,6 +940,31 @@
                                     backwards. Choose <em>Allow the backward move</em> if you intentionally switch readers and need
                                     that newer action to move everyone back — for example after a sleep timer. With that option,
                                     simply opening an out-of-date second reader can also become the new position.
+                                </div>
+                            </div>
+                            <div class="form-group full-width">
+                                <label>When two KOReader devices disagree</label>
+                                <select name="KOSYNC_ACTIVE_DEVICE_WINS">
+                                    <option value="shadow" {% if get_val('KOSYNC_ACTIVE_DEVICE_WINS', 'shadow')|lower == 'shadow' %}selected{% endif %}>
+                                        Watch and log only (recommended)
+                                    </option>
+                                    <option value="on" {% if get_val('KOSYNC_ACTIVE_DEVICE_WINS', 'shadow')|lower == 'on' %}selected{% endif %}>
+                                        Let the device you are reading on win
+                                    </option>
+                                    <option value="off" {% if get_val('KOSYNC_ACTIVE_DEVICE_WINS', 'shadow')|lower == 'off' %}selected{% endif %}>
+                                        Always use the furthest position
+                                    </option>
+                                </select>
+                                <div class="help-text">
+                                    When one book is linked to more than one reader file, the furthest position normally
+                                    wins — which means a device you have not opened in weeks can keep pulling you forward
+                                    on the device you are actually reading. This lets the device you are reading on win
+                                    instead, but only once it has proved itself: several page turns in a row, moving
+                                    forward, from that same device. A single reading is never enough, so merely opening a
+                                    stale reader still cannot move you.
+                                    <strong>Watch and log only</strong> makes no change to what your readers receive — it
+                                    records what it would have chosen, so the behaviour can be checked against real
+                                    devices first.
                                 </div>
                             </div>
                         </div>
@@ -1259,6 +1306,39 @@
                             every N minutes (0 disables). Each user also needs their BookOrbit <strong>KOReader sync</strong>
                             username &amp; password set in Settings → Users → (user) → Integrations — the same
                             credentials BookOrbit's own KOReader plugin uses.</div>
+                    </div>
+
+                    <!-- Read-along sync coexistence -->
+                    <div class="full-width" style="margin: 10px 0; border-top: 1px solid rgba(255,255,255,0.1);"></div>
+                    <h4 class="full-width" style="font-size: 14px; color: #fff; margin-bottom: -10px;">Read-Along Sync</h4>
+                    <div class="form-group">
+                        <label>When BookOrbit syncs read-along books itself</label>
+                        <select name="BOOKORBIT_READALONG_POLICY">
+                            <option value="defer" {% if get_val('BOOKORBIT_READALONG_POLICY', 'defer') == 'defer' %}selected{% endif %}>Let BookOrbit handle it (recommended)</option>
+                            <option value="takeover" {% if get_val('BOOKORBIT_READALONG_POLICY') == 'takeover' %}selected{% endif %}>Turn BookOrbit's off and drive both sides</option>
+                            <option value="ignore" {% if get_val('BOOKORBIT_READALONG_POLICY') == 'ignore' %}selected{% endif %}>Ignore (both write — may conflict)</option>
+                        </select>
+                        <div class="help-text">BookOrbit 3.0.0 and later keeps the audiobook and the EPUB of a
+                            <em>single</em> BookOrbit entry in step by itself, when that entry holds an EPUB 3 with
+                            media overlays (a read-along book) and audio of matching length. Because it does that from
+                            the same endpoints BookBridge writes to, both would be writing the same book.
+                            <strong>Let BookOrbit handle it</strong> writes only the ebook side and lets BookOrbit
+                            move the audio position; <strong>Turn BookOrbit's off</strong> switches its per-book
+                            read-along sync to disabled so BookBridge owns both. Books whose audio and text live in
+                            separate BookOrbit entries — the usual arrangement — are unaffected either way.</div>
+                    </div>
+                    <div class="form-group">
+                        <label>Read-Along Audio Bitrate</label>
+                        <input type="text" name="READALONG_AUDIO_BITRATE"
+                            value="{{ get_val('READALONG_AUDIO_BITRATE', '32k') }}"
+                            placeholder="32k">
+                        <div class="help-text">Bitrate ffmpeg encodes into a generated read-along EPUB's embedded
+                            audio (mono AAC) — e.g. <code>32k</code>, <code>48k</code>. Spoken-word audio stays
+                            intelligible well below music bitrates; Storyteller's own read-along files run about
+                            31kbps. Lower saves storage and download size across the library (roughly 14MB per hour
+                            of audio at the default); higher improves quality at the cost of both. An invalid value
+                            falls back to the default rather than failing generation. Applies the next time a
+                            read-along EPUB is generated — existing generated files are not re-encoded.</div>
                     </div>
                 </div>
             </div>
@@ -2888,35 +2968,48 @@
                             0. Raise it only if mismatches are slipping through.</div>
                     </div>
 
-                    <!-- CTC forced alignment: experimental/advanced, hidden behind a disclosure.
-                         Not in any published image (needs a local INSTALL_CTC=true build) and
-                         effectively needs a GPU — see the note below. -->
-                    <details class="advanced-sub full-width" {% if get_bool('CTC_ENABLED') %}open{% endif %}>
-                        <summary>Advanced · Experimental — CTC forced alignment (needs a custom build + a GPU)</summary>
+                    <!-- Forced (CTC) alignment: the recommended alignment method. QuartzNet runs on
+                         the CPU in every image; MMS needs a local INSTALL_CTC=true build. -->
                     <div class="form-group full-width">
                         <label class="toggle-label">
                             <input type="checkbox" name="CTC_ENABLED"
-                                onchange="toggleSection('ctc_body', this.checked)"
                                 {% if get_bool('CTC_ENABLED') %}checked{% endif %}>
-                            Use CTC forced alignment
+                            Use forced alignment (recommended)
                         </label>
-                        <div class="help-text"><strong>Experimental &amp; advanced — leave off unless you
-                            know you want it.</strong> Aligns the audiobook directly against the known ebook
-                            text (per-word) instead of transcribing and matching back — more accurate for
-                            char-precise readers (BookOrbit, ABS ebook, Grimmory). <strong>Not included in any
-                            published image:</strong> it requires a custom <code>-ctc</code> build
-                            (<code>INSTALL_CTC=true</code>, which bundles torch/torchaudio) and is inert on the
-                            standard and <code>-cuda</code> images. <strong>Effectively requires an NVIDIA
-                            GPU</strong> — on CPU it works only for short books and is very slow on full-length
-                            audiobooks. Leave off to keep the Whisper/lexical pipeline (the default).</div>
+                        <div class="help-text">Aligns each audiobook directly against its ebook's text, word by
+                            word, instead of transcribing it and matching the transcript back. It is more accurate,
+                            especially for readers that track exact positions (BookOrbit, KOReader, the ABS ebook
+                            reader, Grimmory), and it finds each chapter in the audio itself, so long books need no
+                            Whisper transcript. Runs on the CPU in every image: a few minutes per 10 hours of audio
+                            on a modern CPU. English books only; books in other languages, and books whose audio
+                            does not follow the text closely enough, use transcription automatically. Turn off to
+                            always use transcription.</div>
                     </div>
-                    <div id="ctc_body" class="dynamic-group full-width section-body {% if not get_bool('CTC_ENABLED') %}collapsed{% endif %}" style="display:contents;">
+                    <details class="advanced-sub full-width">
+                        <summary>Advanced — forced alignment model</summary>
+                    <div class="dynamic-group full-width" style="display:contents;">
                         <div class="form-group">
                             <label>CTC Model</label>
-                            <input type="text" name="CTC_MODEL" value="{{ get_val('CTC_MODEL', 'mms_fa') }}"
-                                placeholder="mms_fa" autocomplete="off">
-                            <div class="help-text">Forced-alignment model bundle. <code>mms_fa</code> (Meta MMS,
-                                ~1000 languages) is the only supported value today.</div>
+                            <select name="CTC_MODEL">
+                                <option value="quartznet" {% if get_val('CTC_MODEL', 'quartznet') != 'mms_fa' %}selected{% endif %}>QuartzNet
+                                    (English, CPU, any image)</option>
+                                <option value="mms_fa" {% if get_val('CTC_MODEL', 'quartznet') == 'mms_fa' %}selected{% endif %}>MMS
+                                    (~1000 languages, needs the -ctc image)</option>
+                            </select>
+                            <div class="help-text">QuartzNet is NVIDIA's QuartzNet15x5 (the model Storyteller uses),
+                                downloaded once (77 MB) on first use. MMS needs a custom <code>-ctc</code> build
+                                (<code>INSTALL_CTC=true</code>, which bundles torch/torchaudio) and effectively an
+                                NVIDIA GPU; use it for books that are not in English.</div>
+                        </div>
+                        <div class="form-group">
+                            <label>QuartzNet model file</label>
+                            <input type="text" name="CTC_QUARTZNET_MODEL_PATH"
+                                value="{{ get_val('CTC_QUARTZNET_MODEL_PATH', '') }}"
+                                placeholder="/data/models/quartznet15x5-en/model.onnx" autocomplete="off">
+                            <div class="help-text">Optional. A local <code>model.onnx</code> (or the folder holding
+                                it), for example a copy from Storyteller's
+                                <code>ghost-story/models/quartznet15x5-en</code>. Leave empty to download it
+                                from Storyteller's package registry on first use; set it if that download fails.</div>
                         </div>
                         <div class="form-group">
                             <label>CTC Device</label>
@@ -2927,8 +3020,8 @@
                                 <option value="cuda" {% if get_val('CTC_DEVICE')=='cuda' %}selected{% endif %}>GPU
                                     (NVIDIA)</option>
                             </select>
-                            <div class="help-text">Auto uses an NVIDIA GPU when available, otherwise CPU. CTC on CPU
-                                is workable but slow for long audiobooks.</div>
+                            <div class="help-text">MMS only (QuartzNet always runs on the CPU). Auto uses an NVIDIA
+                                GPU when available, otherwise CPU; MMS on CPU is slow for long audiobooks.</div>
                         </div>
                     </div>
                     </details>

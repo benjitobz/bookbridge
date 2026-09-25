@@ -38,6 +38,7 @@ from src.utils.file_transfers import (
     response_declares_size,
     stream_response_to_path,
 )
+from src.utils.logging_utils import sanitize_log_data
 from src.utils.user_config import resolve_setting
 
 logger = logging.getLogger(__name__)
@@ -275,28 +276,19 @@ class BookOrbitClient:
     def _build_light_info(self, book: dict) -> Optional[dict]:
         """Build a lightweight cache entry from a `/books/query` list row.
 
-        File ids are recorded per kind. Neither of BookOrbit's own notions of a
-        "primary" file is kind-aware: `books.primary_file_id` is book-wide, and
-        the file-level `role == "primary"` is format-agnostic where it exists at
-        all (measured live 2026-08-28: present on every book, and an audio format
-        in 57 of 200 sampled - m4b or mp3; the reporter's instance constrains
-        `book_files.role` to content|cover|metadata|supplement, so it is absent
-        there and file order decided instead). Either way a format-agnostic id
-        can name the audiobook on a book that also holds an EPUB, and it must
-        never satisfy a kind-specific lookup - so the ebook and audio ids are
-        kept apart here (#417).
+        Ebook selection shares the read path's primary-file preference. File
+        ids remain kind-specific: a book-wide primary can be an audiobook and
+        must never receive ebook progress (#417).
         """
         book_id = book.get("id")
         if book_id is None:
             return None
-        ebook_file = None
+        ebook_file = self._primary_file(book, kind="ebook")
         audio_file = None
         for f in book.get("files") or []:
             if not isinstance(f, dict):
                 continue
             fmt = (f.get("format") or "").lower()
-            if ebook_file is None and fmt in _EBOOK_FORMATS:
-                ebook_file = f
             if audio_file is None and fmt in _AUDIO_FORMATS:
                 audio_file = f
         kinds = []
@@ -614,6 +606,139 @@ class BookOrbitClient:
         return None
 
     # ------------------------------------------------------------------
+    # Read-along progress sync (BookOrbit v3.0.0+)
+    # ------------------------------------------------------------------
+
+    def get_read_aloud_sync(self, book_id, force: bool = False) -> Optional[dict]:
+        """BookOrbit's own read-along sync status for one book entry, or None.
+
+        v3.0.0 added an internal audiobook<->EPUB progress sync that runs within a
+        single book entry holding a media-overlay EPUB and audio files of matching
+        duration. It fires from the very endpoints BookBridge writes to, so the
+        bridge has to know when BookOrbit is already mirroring a position it just
+        pushed. Reads off the TTL-cached detail payload, so it costs no extra
+        request; a pre-v3 server reports no such block and yields None.
+
+        ``force`` bypasses the detail cache -- needed right after triggering a
+        library scan (:meth:`scan_library`), since the scan runs asynchronously
+        and a caller polling for the result must see fresh data, not whatever
+        was cached up to an hour ago.
+        """
+        detail = self.get_book_detail(book_id, force=force)
+        if not isinstance(detail, dict):
+            return None
+        sync = detail.get("readAloudSync")
+        return sync if isinstance(sync, dict) else None
+
+    @staticmethod
+    def read_aloud_sync_is_active(sync: Optional[dict]) -> bool:
+        """Whether BookOrbit will mirror a write between this entry's formats.
+
+        BookOrbit resolves the whole question itself and reports the verdict as
+        `state`: 'enabled' only once the mode is on, a media-overlay EPUB exists,
+        audio exists, and the durations agree within its own tolerance. Every
+        other value - 'disabled', 'unavailable', or a pre-v3 payload carrying no
+        block at all - means BookBridge remains the only writer.
+        """
+        if not isinstance(sync, dict):
+            return False
+        return str(sync.get("state") or "").strip().lower() == "enabled"
+
+    def set_read_aloud_sync_mode(self, book_id, mode: str) -> bool:
+        """Set BookOrbit's per-entry read-along sync mode ('auto' or 'disabled').
+
+        Used only by the 'takeover' policy, which hands the mapping back to
+        BookBridge. Invalidates the cached detail so the new mode is observed on
+        the next read rather than an hour later.
+        """
+        if book_id is None:
+            return False
+        normalized = (mode or "").strip().lower()
+        if normalized not in ("auto", "disabled"):
+            logger.warning(
+                "BookOrbit: refusing to set read-along sync mode to an unknown value %s",
+                sanitize_log_data(mode),
+            )
+            return False
+        resp = self._make_request(
+            "PATCH", f"/api/v1/books/{book_id}/read-aloud-sync", {"mode": normalized}
+        )
+        if not resp or resp.status_code not in (200, 204):
+            status = resp.status_code if resp else "no response"
+            logger.warning(
+                "BookOrbit: could not set read-along sync mode for book %s: status=%s",
+                book_id, status,
+            )
+            return False
+        with self._cache_lock:
+            self._detail_cache.pop(book_id, None)
+        return True
+
+    # ------------------------------------------------------------------
+    # Libraries & scanning (used by read-along delivery, Phase 5)
+    # ------------------------------------------------------------------
+
+    def get_libraries(self) -> list:
+        """All configured BookOrbit libraries, each with its ``folders`` list.
+
+        Used to derive a library id from a filesystem folder when a book
+        detail's own ``libraryId`` is unavailable. Not cached: called at most
+        once per read-along delivery, unlike book detail/audiobook info which
+        sit on the hot sync-cycle path.
+        """
+        resp = self._make_request("GET", "/api/v1/libraries")
+        if not resp or resp.status_code != 200:
+            status = resp.status_code if resp else "no response"
+            logger.warning("BookOrbit: could not fetch libraries: status=%s", status)
+            return []
+        data = self._parse_json(resp)
+        return data if isinstance(data, list) else []
+
+    def scan_library(self, library_id: Optional[int]) -> bool:
+        """Trigger a BookOrbit library scan so newly-written files get indexed.
+
+        Fire-and-forget: BookOrbit runs the scan asynchronously and returns
+        202 once the request is accepted, before the scan itself finishes.
+        Returning ``True`` here confirms only that BookOrbit *accepted* the
+        request -- a caller that needs to know the scan's actual outcome
+        (e.g. whether a newly-placed file was indexed) must poll
+        :meth:`get_book_detail` / :meth:`get_read_aloud_sync` with
+        ``force=True`` afterward rather than trust this return value alone.
+        """
+        if library_id is None:
+            return False
+        resp = self._make_request("POST", f"/api/v1/scanner/libraries/{library_id}/scan")
+        if not resp or resp.status_code not in (200, 202, 204):
+            status = resp.status_code if resp else "no response"
+            logger.warning(
+                "BookOrbit: library scan request failed for library %s: status=%s",
+                library_id, status,
+            )
+            return False
+        return True
+
+    def delete_book_file(self, file_id: Optional[int]) -> bool:
+        """Remove a single file from a BookOrbit book entry (not the whole entry).
+
+        Used to clean up a read-along EPUB this bridge generated without
+        touching the rest of the entry (its real audio tracks, cover,
+        metadata) -- unlike ``DELETE /api/v1/books``, which deletes the whole
+        book. Invalidates no cache entry directly since the caller does not
+        have the owning book id here; callers that immediately re-read detail
+        for that book should pass ``force=True``.
+        """
+        if file_id is None:
+            return False
+        resp = self._make_request("DELETE", f"/api/v1/books/files/{file_id}")
+        if not resp or resp.status_code not in (200, 204):
+            status = resp.status_code if resp else "no response"
+            logger.warning(
+                "BookOrbit: could not delete file %s: status=%s", file_id, status,
+            )
+            return False
+        return True
+
+    # ------------------------------------------------------------------
     # Resolution
     # ------------------------------------------------------------------
 
@@ -899,7 +1024,9 @@ class BookOrbitClient:
         position; without it BookOrbit derives a chapter-root xpointer from the CFI.
         """
         book_id = book_info.get("id")
-        file_id = book_info.get("ebookFileId")
+        file_id = self._resolve_primary_file_id(book_id, "ebook")
+        if file_id is None:
+            file_id = book_info.get("ebookFileId")
         if file_id is None:
             cached_id = book_info.get("primaryFileId")
             cached_format = (book_info.get("primaryFormat") or "").lower()
@@ -912,7 +1039,6 @@ class BookOrbitClient:
                         "- it is not an ebook file; resolving the ebook file instead",
                         cached_id, cached_format or "unknown", book_id,
                     )
-                file_id = self._resolve_primary_file_id(book_id, "ebook")
         if file_id is None:
             logger.error("BookOrbit: cannot update ebook — no primary file id for book %s", book_id)
             return False

@@ -33,6 +33,7 @@ from .models import (
     ReadingSessionBuffer,
     KOReaderBookStat,
     KOReaderPageStat,
+    KOReaderBookStatus,
     KoreaderAnnotation,
     KoreaderAnnotationDeviceState,
     ShelfWatchScan,
@@ -44,6 +45,7 @@ from .models import (
     UserBookFusionLink,
     UserBookOrbitLink,
     Base,
+    JOB_KIND_READALONG,
 )
 from src.services.map_quality import ALIGNMENT_QUALITY_REALIGN_THRESHOLD, quality_detail_json, score_map
 from src.utils import secret_store
@@ -689,6 +691,27 @@ class DatabaseService:
                 .filter(BookAlignment.align_method == "ctc").all()
             }
 
+    def get_readalong_alignment_book_ids(self) -> set[str]:
+        """Book IDs whose alignment map is fine-grained enough for read-along
+        generation ('ctc', 'lexical', or 'lexical_timed'), in one query
+        without loading map blobs.
+
+        Mirrors `get_ctc_aligned_book_ids`. Coarser methods ('linear',
+        'llm_anchor', 'storyteller'/'storyteller_linear', legacy NULL) are
+        excluded even though `build_readalong_epub` would not itself refuse
+        them -- their timing is not fine enough to be worth surfacing as an
+        eligible book in the UI. 'lexical_timed' (measured word timings)
+        belongs alongside 'ctc'/'lexical' here, matching the route's own
+        eligibility guard in
+        `web_server.generate_readalong_epub` and the post-forge hook in
+        `forge_service.py`.
+        """
+        with self.get_session() as session:
+            return {
+                row[0] for row in session.query(BookAlignment.abs_id)
+                .filter(BookAlignment.align_method.in_(("ctc", "lexical", "lexical_timed"))).all()
+            }
+
     def set_alignment_total_chars_if_missing(self, abs_id: str, total_chars: int) -> bool:
         """Record an ebook length on a map that has none. Returns whether it wrote.
 
@@ -1086,6 +1109,37 @@ class DatabaseService:
             session.refresh(existing)
             session.expunge(existing)
             return existing
+
+    def set_readalong_epub_requested(self, abs_id: str, requested: bool = True) -> bool:
+        """Record (or clear) the read-along-EPUB-generation intent for one book.
+
+        A direct, single-column UPDATE -- deliberately kept OUT of
+        ``save_book``'s generic attribute whitelist so an unrelated field save
+        elsewhere in the 400+ callers of ``Book(...)`` can never silently set
+        or clear this flag as a side effect. Returns True if a row was found
+        and updated.
+        """
+        with self.get_session() as session:
+            updated = session.query(Book).filter(Book.abs_id == abs_id).update(
+                {"readalong_epub_requested": bool(requested)},
+                synchronize_session=False,
+            )
+            return updated > 0
+
+    def consume_readalong_epub_intent(self, abs_id: str) -> bool:
+        """Atomically read-and-clear the read-along intent for one book.
+
+        Returns True exactly once per recorded intent: the flag is cleared in
+        the same UPDATE it is read from, so a second forge of the same book
+        (a manual re-forge, a restart-triggered resume) never re-fires
+        generation from a stale flag. Returns False when no intent was
+        recorded (the common case) or the book no longer exists.
+        """
+        with self.get_session() as session:
+            updated = session.query(Book).filter(
+                Book.abs_id == abs_id, Book.readalong_epub_requested.is_(True),
+            ).update({"readalong_epub_requested": False}, synchronize_session=False)
+            return updated > 0
 
     def backfill_ebook_source_id_if_unclaimed(
         self,
@@ -1894,10 +1948,21 @@ class DatabaseService:
             return count
 
     # Job operations
-    def get_latest_job(self, abs_id: str) -> Optional[Job]:
-        """Get the latest job for a book."""
+    def get_latest_job(self, abs_id: str, kind: Optional[str] = None) -> Optional[Job]:
+        """Get the latest job for a book.
+
+        `kind` is a filter, not the job attribute of the same name: omitted
+        (the default), it preserves the historical behavior of returning the
+        newest job row regardless of kind. Passing a kind (see
+        `src.db.models.JOB_KIND_ALIGNMENT` / `JOB_KIND_READALONG`) scopes the
+        lookup to jobs of that kind only, so an unrelated job type's newer
+        timestamp can never shadow the one the caller actually wants.
+        """
         with self.get_session() as session:
-            job = session.query(Job).filter(Job.abs_id == abs_id).order_by(Job.last_attempt.desc()).first()
+            query = session.query(Job).filter(Job.abs_id == abs_id)
+            if kind is not None:
+                query = query.filter(Job.kind == kind)
+            job = query.order_by(Job.last_attempt.desc()).first()
             if job:
                 session.expunge(job)
             return job
@@ -1927,10 +1992,20 @@ class DatabaseService:
             session.expunge(job)
             return job
 
-    def update_latest_job(self, abs_id: str, **kwargs) -> Optional[Job]:
-        """Update the latest job for a book."""
+    def update_latest_job(self, abs_id: str, kind: Optional[str] = None, **kwargs) -> Optional[Job]:
+        """Update the latest job for a book.
+
+        `kind` filters which job counts as "latest" the same way
+        `get_latest_job`'s does (see its docstring) -- it is not itself set
+        via `kwargs`. Omitted, the newest row regardless of kind is updated
+        (historical behavior); passed, only the newest row of that kind is
+        considered, and no update happens if none exists.
+        """
         with self.get_session() as session:
-            job = session.query(Job).filter(Job.abs_id == abs_id).order_by(Job.last_attempt.desc()).first()
+            query = session.query(Job).filter(Job.abs_id == abs_id)
+            if kind is not None:
+                query = query.filter(Job.kind == kind)
+            job = query.order_by(Job.last_attempt.desc()).first()
             if job:
                 for key, value in kwargs.items():
                     if hasattr(job, key):
@@ -1941,12 +2016,50 @@ class DatabaseService:
                 return job
             return None
 
-    def delete_jobs_for_book(self, abs_id: str) -> int:
-        """Delete all jobs for a book."""
+    def update_job_by_id(self, job_id: int, **kwargs) -> Optional[Job]:
+        """Update exactly one job row by primary key."""
         with self.get_session() as session:
-            count = session.query(Job).filter(Job.abs_id == abs_id).count()
-            session.query(Job).filter(Job.abs_id == abs_id).delete()
+            job = session.query(Job).filter(Job.id == job_id).first()
+            if job:
+                for key, value in kwargs.items():
+                    if hasattr(job, key):
+                        setattr(job, key, value)
+                session.flush()
+                session.refresh(job)
+                session.expunge(job)
+                return job
+            return None
+
+    def delete_jobs_for_book(self, abs_id: str, kind: Optional[str] = None) -> int:
+        """Delete a book's jobs; all of them, or only those of ``kind``."""
+        with self.get_session() as session:
+            query = session.query(Job).filter(Job.abs_id == abs_id)
+            if kind is not None:
+                query = query.filter(Job.kind == kind)
+            count = query.count()
+            query.delete(synchronize_session=False)
             return count
+
+    def get_readalong_ready_book_ids(self) -> set[str]:
+        """Book IDs whose most recent read-along job finished (progress 1.0), the
+        state the read-along status endpoint reports as "done". One query, for the
+        dashboard's read-along badge; removing a read-along deletes its job rows."""
+        from sqlalchemy import func
+
+        with self.get_session() as session:
+            # Same "latest" as get_latest_job (by last_attempt), so the badge and
+            # the status endpoint never disagree.
+            latest = (
+                session.query(Job.abs_id.label("abs_id"), func.max(Job.last_attempt).label("last_attempt"))
+                .filter(Job.kind == JOB_KIND_READALONG)
+                .group_by(Job.abs_id)
+                .subquery()
+            )
+            return {
+                row[0] for row in session.query(Job.abs_id)
+                .join(latest, (Job.abs_id == latest.c.abs_id) & (Job.last_attempt == latest.c.last_attempt))
+                .filter(Job.kind == JOB_KIND_READALONG, Job.progress >= 1.0).all()
+            }
 
     # HardcoverDetails operations
     def get_hardcover_details(self, abs_id: str) -> Optional[HardcoverDetails]:
@@ -3163,6 +3276,220 @@ class DatabaseService:
         pages = int(row.pages) if row.pages else 0
         last_updated = row.last_updated.timestamp() if row.last_updated else 0.0
         return (pages, last_updated)
+
+    # ------------------------------------------------------------------
+    # KOReader reading status (sidecar summary.status sync between devices)
+    # ------------------------------------------------------------------
+
+    # Ranked low to high. A later `modified` date always wins first; this order
+    # only ever breaks a tie between two devices carrying the SAME date. Measured
+    # against the real divergence between two devices (30 conflicting books):
+    # ordering by date alone resolved 28 with no counterexamples, and both
+    # remaining same-day ties resolve correctly here. Keeping 'complete' above
+    # 'reading' also means a same-day reopen can never silently un-finish a book.
+    # 'unread' is the bridge's own CLEAR sentinel, not a KOReader status: a device
+    # applying it removes the sidecar's status so the book reads as never opened.
+    # It outranks everything on a same-day tie because only an explicit, freshly
+    # timestamped user action in the bridge (Clear Progress) can emit it -- no
+    # passive source is allowed to, which is why BookOrbit's `unread` (its DEFAULT
+    # state for an untouched book) is deliberately NOT mapped onto it. Without
+    # that rule, clearing right after finishing a book -- exactly what someone
+    # about to re-read does -- would lose the tie to 'complete' and do nothing.
+    KOREADER_STATUS_PRECEDENCE: tuple[str, ...] = (
+        '', 'reading', 'abandoned', 'complete', 'unread',
+    )
+    KOREADER_STATUS_CLEARED: str = 'unread'
+
+    @classmethod
+    def _koreader_status_rank(cls, status: str) -> int:
+        """Precedence rank for a KOReader status; unknown values sort lowest."""
+        try:
+            return cls.KOREADER_STATUS_PRECEDENCE.index(str(status or '').strip().lower())
+        except ValueError:
+            return 0
+
+    @classmethod
+    def _koreader_status_sort_key(cls, row) -> tuple:
+        """Winner ordering for one book's per-device status rows.
+
+        ``modified`` is the device's own date for the status change, so it is the
+        closest thing to "when did the reader decide this" and leads the key.
+        It is date-granularity and comes off two different device clocks, which is
+        exactly why the precedence rank — not the second clock — breaks the tie.
+        ``received_at`` is the bridge's single clock and only separates rows that
+        agree on both date and status.
+        """
+        return (
+            str(row.modified or ''),
+            cls._koreader_status_rank(row.status),
+            float(row.received_at or 0.0),
+        )
+
+    def upsert_koreader_book_status(
+        self,
+        device: str,
+        device_id: str,
+        books: list[dict],
+        user_id: int = None,
+        received_at: float = None,
+    ) -> int:
+        """Upsert one device's reported sidecar statuses. Returns rows accepted."""
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        device_key = self._normalize_koreader_device_key(device=device, device_id=device_id)
+        if not device_key:
+            return 0
+        uid = self._resolve_uid(user_id)
+        stamp = float(received_at if received_at is not None else time.time())
+
+        rows = []
+        seen: set[str] = set()
+        for book in books or []:
+            md5 = str(book.get("md5") or "").strip()
+            status = str(book.get("status") or "").strip().lower()
+            # An empty status carries no decision and must not outrank another
+            # device's real one -- KOReader writes `status = ""` in the wild.
+            if not md5 or not status or md5 in seen:
+                continue
+            seen.add(md5)
+            modified = str(book.get("modified") or "").strip() or None
+            rows.append({
+                "md5": md5,
+                "user_id": uid,
+                "device": str(device or "").strip() or None,
+                "device_id": str(device_id or "").strip() or None,
+                "device_key": device_key,
+                "status": status,
+                "modified": modified,
+                "received_at": stamp,
+                "last_updated": utcnow(),
+            })
+
+        if not rows:
+            return 0
+
+        with self.get_session() as session:
+            stmt = sqlite_insert(KOReaderBookStatus).values(rows)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["md5", "user_id", "device_key"],
+                set_={
+                    "device": stmt.excluded.device,
+                    "device_id": stmt.excluded.device_id,
+                    "status": stmt.excluded.status,
+                    "modified": stmt.excluded.modified,
+                    "received_at": stmt.excluded.received_at,
+                    "last_updated": utcnow(),
+                },
+            )
+            session.execute(stmt)
+        return len(rows)
+
+    def record_koreader_status_for_book(
+        self,
+        abs_id: str,
+        status: str,
+        device_key: str,
+        user_id: int = None,
+        modified: str = None,
+        device: str = None,
+        only_if_absent: bool = False,
+    ) -> int:
+        """Record a bridge-originated status against every md5 linked to ``abs_id``.
+
+        Used by sources that speak in books rather than document hashes (Clear
+        Progress, the completion edge, the started edge). A book can have several
+        sibling hashes -- different EPUB builds of the same title -- and each
+        device knows only its own copy, so every linked hash gets the row.
+
+        ``only_if_absent`` writes nothing for a hash that already has a status
+        from any source. Inferring a status from POSITION must only fill a gap,
+        never overrule a real decision: a book deliberately marked 'abandoned'
+        half way through still has position, and would otherwise be dragged back
+        to 'reading' on the next cycle, every cycle.
+
+        Returns the number of hashes written.
+        """
+        abs_id = str(abs_id or '').strip()
+        status = str(status or '').strip().lower()
+        if not abs_id or not status:
+            return 0
+
+        hashes = []
+        for doc in self.get_kosync_documents_for_book(abs_id):
+            doc_hash = str(getattr(doc, 'document_hash', '') or '').strip()
+            if doc_hash:
+                hashes.append(doc_hash)
+        if not hashes:
+            return 0
+
+        if only_if_absent:
+            uid = self._resolve_uid(user_id)
+            with self.get_session() as session:
+                query = session.query(KOReaderBookStatus.md5).filter(
+                    KOReaderBookStatus.md5.in_(hashes)
+                )
+                taken = {row.md5 for row in self._scope_koreader_user(
+                    query, KOReaderBookStatus, uid).all()}
+            hashes = [h for h in hashes if h not in taken]
+            if not hashes:
+                return 0
+
+        stamp = modified or datetime.now().strftime('%Y-%m-%d')
+        return self.upsert_koreader_book_status(
+            device=device or device_key,
+            device_id=device_key,
+            books=[{"md5": h, "status": status, "modified": stamp} for h in hashes],
+            user_id=user_id,
+        )
+
+    def resolve_koreader_book_status(
+        self,
+        user_id: int = None,
+        md5s: Optional[set[str]] = None,
+        limit: int = 5000,
+    ) -> list[dict]:
+        """Resolve the cross-device winning status for each book.
+
+        Returns ``[{md5, status, modified, source_device_key}]``. A device applies
+        any entry whose status differs from its own sidecar; entries it already
+        agrees with are a no-op there, so no per-device filtering happens here.
+        """
+        uid = self._resolve_uid(user_id)
+        md5s = {str(m).strip() for m in (md5s or set()) if str(m).strip()}
+        limit = max(min(int(limit or 5000), 5000), 1)
+
+        # Select columns rather than ORM instances: the ranking below happens after
+        # the session closes, and a detached instance would raise on attribute
+        # access the moment it needed a refresh.
+        with self.get_session() as session:
+            query = session.query(
+                KOReaderBookStatus.md5,
+                KOReaderBookStatus.status,
+                KOReaderBookStatus.modified,
+                KOReaderBookStatus.device_key,
+                KOReaderBookStatus.received_at,
+            )
+            query = self._scope_koreader_user(query, KOReaderBookStatus, uid)
+            if md5s:
+                query = query.filter(KOReaderBookStatus.md5.in_(md5s))
+            rows = query.all()
+
+        best: dict[str, tuple] = {}
+        for row in rows:
+            current = best.get(row.md5)
+            if current is None or self._koreader_status_sort_key(row) > self._koreader_status_sort_key(current):
+                best[row.md5] = row
+
+        winners = sorted(best.values(), key=lambda r: r.md5)[:limit]
+        return [
+            {
+                "md5": row.md5,
+                "status": row.status,
+                "modified": row.modified or "",
+                "source_device_key": row.device_key,
+            }
+            for row in winners
+        ]
 
     # ------------------------------------------------------------------
     # KOReader annotation hub (highlights/notes sync between devices + web)

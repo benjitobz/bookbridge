@@ -1,4 +1,5 @@
 import os
+import time
 from typing import Optional
 import logging
 
@@ -106,6 +107,9 @@ class StorytellerSyncClient(SyncClient):
 
         st_pct, st_ts, st_href, st_frag, st_chapter_progress = None, None, None, None, None
         st_fragments, st_css_selector, st_position, st_cfi = None, None, None, None
+        # Only the dict payload path carries a client-supplied position marker
+        # (#447); the legacy tuple fallback paths have no equivalent field.
+        st_position_ts = None
 
         try:
             position_payload = None
@@ -123,6 +127,7 @@ class StorytellerSyncClient(SyncClient):
                 st_css_selector = position_payload.get("css_selector")
                 st_position = position_payload.get("position") or position_payload.get("match_index")
                 st_cfi = position_payload.get("cfi")
+                st_position_ts = position_payload.get("position_ts")
             else:
                 position_details = None
                 rich_fetch = getattr(self.storyteller_client, "get_position_details_rich", None)
@@ -191,6 +196,10 @@ class StorytellerSyncClient(SyncClient):
             current["match_index"] = st_position
         if st_cfi:
             current["cfi"] = st_cfi
+        if st_position_ts:
+            # Opaque provenance token (#447): identity, not value — see
+            # write_tracker.marker_echo_verdict and _peer_position_is_own_writeback.
+            current["_position_marker"] = int(st_position_ts)
 
         return ServiceState(
             current=current,
@@ -286,13 +295,16 @@ class StorytellerSyncClient(SyncClient):
                 )
                 logger.debug(f"Resolved Storyteller href from percentage: {locator.href}")
 
+        write_ts = int(time.time() * 1000)
         if book.storyteller_uuid:
-            success = self.storyteller_client.update_position(book.storyteller_uuid, pct, locator)
+            success = self.storyteller_client.update_position(
+                book.storyteller_uuid, pct, locator, timestamp=write_ts
+            )
             if success:
                 try:
                     from src.services.write_tracker import record_write
 
-                    record_write("Storyteller", book.abs_id, pct)
+                    record_write("Storyteller", book.abs_id, pct, marker=write_ts)
                 except ImportError:
                     pass
         else:
@@ -317,6 +329,8 @@ class StorytellerSyncClient(SyncClient):
         if locator.match_index is not None:
             updated_state['position'] = locator.match_index
             updated_state['match_index'] = locator.match_index
+        if success and book.storyteller_uuid:
+            updated_state['_position_marker'] = write_ts
 
         return SyncResult(pct, success, updated_state)
 

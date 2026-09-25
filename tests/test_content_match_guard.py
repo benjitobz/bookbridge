@@ -75,6 +75,20 @@ def test_overlap_identical_text_scores_near_one():
     assert transcript_text_overlap(text, text) == pytest.approx(1.0)
 
 
+def test_overlap_survives_an_inline_word_join_in_the_ebook_text():
+    """``_WORD_TOKEN_RE`` (``[a-z0-9']+``) does not include
+    ``INLINE_TEXT_JOINER``, so left in place it would split a bionic-reading
+    mid-word join (e.g. ``"th<JOINER>e"``) back into two separate tokens
+    ("th", "e") that never match the transcript's single "the" token --
+    scoring a perfectly matching book as a mismatch. ``_word_tokens`` strips
+    it first so this still scores as a full match."""
+    from src.utils.ebook_dom_map import INLINE_TEXT_JOINER
+
+    text = _sequential_words(200)
+    fragmented_ebook_text = text.replace("word", f"wo{INLINE_TEXT_JOINER}rd")
+    assert transcript_text_overlap(text, fragmented_ebook_text) == pytest.approx(1.0)
+
+
 def test_overlap_unrelated_text_scores_near_zero():
     ebook = _sequential_words(200, start=0)
     transcript = _sequential_words(200, start=100_000)

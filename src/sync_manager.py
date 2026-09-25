@@ -33,7 +33,7 @@ def _extract_series_from_abs_item(item_details: dict) -> tuple:
 
 import json
 from src.api.storyteller_api import StorytellerAPIClient
-from src.db.models import Job
+from src.db.models import Job, JOB_KIND_ALIGNMENT
 from src.db.models import State, Book, PendingSuggestion
 from src.sync_clients.sync_client_interface import UpdateProgressRequest, LocatorResult, ServiceState, SyncResult, SyncClient, ABS_ITEM_NOT_FOUND
 from src.utils.user_context import (
@@ -98,6 +98,11 @@ _STATE_FETCH_SLOW_SECONDS = 15.0
 # cfi is None (which a percentage-only LocatorResult produces), so it can only
 # ever log a warning and fail — and the ABS branch's mark_finished already
 # marks the whole ABS library item finished, which covers the ebook side.
+# Floor below which position is not evidence that a book is being read. Reuses
+# the 1% suggestion-eligibility floor the tracker posts already apply, so
+# "opened it for ten seconds" does not become 'reading' on every device.
+_KOREADER_READING_MIN_PCT: float = 0.01
+
 _COMPLETION_PROPAGATION_EXCLUDED_CLIENTS: frozenset[str] = frozenset({
     "StoryGraph",
     "Hardcover",
@@ -133,6 +138,13 @@ _CFI_DEPENDENT_CLIENTS: frozenset[str] = frozenset({
     "BookLore",
     "CWA",
 })
+
+# How BookBridge behaves when BookOrbit's own read-along sync (v3.0.0+) already
+# mirrors a book's position between the two formats of a single BookOrbit entry.
+# 'defer'    — BookBridge writes the ebook side only and lets BookOrbit fan out
+# 'takeover' — BookBridge disables BookOrbit's sync for that entry and drives both
+# 'ignore'   — pre-v3 behaviour; both sides written, echoes unguarded
+_BOOKORBIT_READALONG_POLICIES: frozenset[str] = frozenset({"defer", "takeover", "ignore"})
 
 # Multi-user: per-cycle override of the active sync-client bundle. Set by
 # sync_cycle when running for a specific user; None => use the global clients.
@@ -207,7 +219,10 @@ class SyncManager:
             [shelf_watch_service] if shelf_watch_service else []
         )
         self.audio_source_adapters = audio_source_adapters or {}
-        
+        # Injected by web_server.create_app (ForgeService.generate_readalong_if_requested),
+        # like the Forge read-along callbacks, so this module never imports web_server.
+        self.readalong_intent_dispatcher = None
+
         self.data_dir = data_dir
         self.books_dir = books_dir
 
@@ -357,6 +372,107 @@ class SyncManager:
         except (TypeError, ValueError):
             value = 99.0
         return max(0.0, min(value, 100.0)) / 100.0
+
+    def _mark_koreader_complete(
+        self,
+        book,
+        abs_id: str,
+        title_snip: str,
+        leader: str,
+    ) -> None:
+        """Record 'complete' for the KOReader devices when a book reaches the end.
+
+        The bridge already decides a book is finished during the ordinary cycle, off
+        whichever client led it -- BookOrbit, ABS, Grimmory, CWA, Storyteller. That
+        decision is the natural source for the devices' reading status, so no service
+        needs polling for a status field of its own.
+
+        Position is untouched here; only the status the file browser shows.
+        """
+        if not env_truthy('KOREADER_STATUS_SYNC_ENABLED', 'true'):
+            return
+        try:
+            written = self.database_service.record_koreader_status_for_book(
+                abs_id,
+                status='complete',
+                device_key='bridge',
+                user_id=get_current_user_id(),
+            )
+            if written:
+                logger.info(
+                    f"🏁 '{abs_id}' '{title_snip}' marked finished for KOReader "
+                    f"({written} document hash(es), leader '{leader}')"
+                )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Could not mark '{sanitize_log_data(abs_id)}' finished for KOReader: {e}",
+                exc_info=True,
+            )
+
+    def _maybe_mark_koreader_reading_from_config(
+        self,
+        book,
+        config: dict,
+        abs_id: str,
+        title_snip: str,
+    ) -> None:
+        """Apply the 'reading' gap-fill using the highest position any client reports.
+
+        Used on the no-change path, where no leader is chosen. The furthest
+        position across clients is the same figure the dashboard calls the book's
+        progress, so the two agree on what "in progress" means.
+        """
+        pcts = [
+            cfg.current.get('pct')
+            for cfg in config.values()
+            if cfg and cfg.current.get('pct') is not None
+        ]
+        if not pcts:
+            return
+        current_pct = max(pcts)
+        if current_pct > _KOREADER_READING_MIN_PCT and current_pct < self._completion_threshold():
+            self._mark_koreader_reading(book, abs_id, title_snip, current_pct)
+
+    def _mark_koreader_reading(
+        self,
+        book,
+        abs_id: str,
+        title_snip: str,
+        leader_pct: float,
+    ) -> None:
+        """Give a part-read book a 'reading' status for the devices, if it has none.
+
+        The dashboard calls a book in progress on POSITION (0 < pct < 100), while
+        KOReader's 'reading' is a separate flag it only writes through its own
+        book-status UI. A book you opened briefly has position and no status, so
+        it shows as in progress on the bridge and as untouched on every reader.
+        This closes that gap from the position the cycle already knows.
+
+        Strictly gap-filling: a book that already has a status from anywhere keeps
+        it. Position says a book was opened, which is weaker evidence than a
+        reader explicitly marking it finished or abandoned, and must never
+        overrule one.
+        """
+        if not env_truthy('KOREADER_STATUS_SYNC_ENABLED', 'true'):
+            return
+        try:
+            written = self.database_service.record_koreader_status_for_book(
+                abs_id,
+                status='reading',
+                device_key='bridge',
+                user_id=get_current_user_id(),
+                only_if_absent=True,
+            )
+            if written:
+                logger.info(
+                    f"📖 '{abs_id}' '{title_snip}' marked reading for KOReader "
+                    f"({written} document hash(es), position {leader_pct:.1%})"
+                )
+        except Exception as e:
+            logger.warning(
+                f"⚠️ Could not mark '{sanitize_log_data(abs_id)}' reading for KOReader: {e}",
+                exc_info=True,
+            )
 
     def _propagate_completion(
         self,
@@ -769,6 +885,26 @@ class SyncManager:
             return paths
         return None
 
+    def _dispatch_readalong_intent(self, book) -> None:
+        """Hand a freshly aligned book to read-along generation.
+
+        The Storyteller-free Match All path records "Also generate a read-along
+        EPUB" as an intent on the book; this background job is where its alignment
+        completes, so this is where the intent is consumed. The dispatcher consumes
+        it exactly once and does nothing for a book without one. A failure here
+        must never mark the alignment job itself as failed.
+        """
+        dispatcher = getattr(self, "readalong_intent_dispatcher", None)
+        if dispatcher is None:
+            return
+        try:
+            dispatcher(book)
+        except Exception as e:
+            logger.warning(
+                "Read-along EPUB: post-alignment dispatch failed for '%s': %s",
+                getattr(book, "abs_id", None), e, exc_info=True,
+            )
+
     def _try_ctc_alignment(self, abs_id: str, audio_paths: list, book_text: str,
                            spine_chapters: Optional[list], abs_title: str,
                            audio_duration: Optional[float], source_label: str) -> bool:
@@ -863,7 +999,8 @@ class SyncManager:
         return int(max(600.0, min(window, 3600.0)))
 
     def _peer_position_is_own_writeback(
-        self, abs_id: str, client_name: str, observed_pct: float, margin: float
+        self, abs_id: str, client_name: str, observed_pct: float, margin: float,
+        observed_marker: object = None, title_snip: str = "",
     ) -> bool:
         """Whether a peer's current position is the echo of BookBridge's own write.
 
@@ -875,9 +1012,17 @@ class SyncManager:
         to this user, or to the unscoped namespace a globally-triggered sync
         records under — still matches the value the service now reports. A missing,
         expired, percentage-less, mismatched or wrong-user marker leaves the veto
-        exactly as it was."""
+        exactly as it was.
+
+        When the client supplies a position marker (an opaque, service-stored
+        provenance token the service returns verbatim until someone else writes
+        to it — #447), that identity match takes precedence over the percentage
+        match: a user read landing within `margin` of our last write is no longer
+        mistaken for our own echo, and a marker that has moved on is never
+        mistaken for an echo just because the percentage still happens to be
+        close."""
         try:
-            from src.services.write_tracker import GLOBAL_USER, get_recent_write
+            from src.services.write_tracker import GLOBAL_USER, get_recent_write, marker_echo_verdict
         except ImportError:
             return False
 
@@ -890,6 +1035,26 @@ class SyncManager:
         if not recent:
             return False
 
+        verdict = marker_echo_verdict(recent, observed_marker)
+        if verdict is not None:
+            if verdict is False:
+                written_pct = recent.get('pct')
+                try:
+                    margin_matched = (
+                        written_pct is not None
+                        and observed_pct is not None
+                        and abs(float(written_pct) - float(observed_pct)) <= margin
+                    )
+                except (TypeError, ValueError):
+                    margin_matched = False
+                if margin_matched:
+                    logger.info(
+                        f"🪞 '{abs_id}' '{title_snip}' '{client_name}' ({observed_pct:.2%}) is within "
+                        f"{margin:.2%} of BookBridge's own write-back ({written_pct:.2%}), but the "
+                        f"service's position marker changed since that write - treating it as user movement"
+                    )
+            return verdict
+
         written_pct = recent.get('pct')
         if written_pct is None or observed_pct is None:
             return False
@@ -897,6 +1062,110 @@ class SyncManager:
             return abs(float(written_pct) - float(observed_pct)) <= margin
         except (TypeError, ValueError):
             return False
+
+    @staticmethod
+    def _bookorbit_readalong_policy() -> str:
+        """'defer' | 'takeover' | 'ignore' — read per call so Settings applies live."""
+        raw = (os.environ.get('BOOKORBIT_READALONG_POLICY', 'defer') or 'defer').strip().lower()
+        if raw not in _BOOKORBIT_READALONG_POLICIES:
+            logger.warning(
+                f"⚠️ BOOKORBIT_READALONG_POLICY={sanitize_log_data(raw)} is not one of "
+                f"{'/'.join(sorted(_BOOKORBIT_READALONG_POLICIES))} — using 'defer'"
+            )
+            return 'defer'
+        return raw
+
+    def _mark_bookorbit_readalong_mirror(self, book, config, abs_id: str, title_snip: str) -> None:
+        """Flag the BookOrbit audio state as BookOrbit's own mirror of our writes.
+
+        BookOrbit v3.0.0 keeps one book entry's audiobook and media-overlay EPUB
+        positions in step, and it does so from the very endpoints BookBridge
+        writes to: a push to `POST /books/files/{id}/progress` moves that entry's
+        audio position, and a push to `PATCH /books/{id}/audio-progress` moves its
+        EPUB. When the bridge maps BOTH of a book's formats onto that ONE entry,
+        every write it makes is answered by a second, BookOrbit-authored write to
+        the other format.
+
+        That second write is invisible to the echo guards: `record_write` recorded
+        'BookOrbit', the movement surfaces under 'BookOrbitAudio', and
+        `_peer_position_is_own_writeback` matches by value — which BookOrbit's own
+        SMIL mapping of our position will not reproduce. So the next cycle reads
+        it as user movement and round-trips a text position through the audio
+        timeline.
+
+        Rather than weaken a value-matched guard, stop creating the second writer:
+        mark the audio side as a mirror, which excludes it from leading and from
+        being written. BookBridge drives the ebook side (a CFI and an xpointer,
+        against the audio side's single scalar) and BookOrbit fans it out.
+
+        Only fires when both formats resolve to the same BookOrbit entry AND
+        BookOrbit itself reports `readAloudSync.state == 'enabled'` for it — a
+        pre-v3 server, a disabled entry, a missing media overlay or mismatched
+        durations all leave the cycle exactly as it was.
+        """
+        audio_state = config.get('BookOrbitAudio')
+        if audio_state is None or 'BookOrbit' not in config:
+            return
+
+        policy = self._bookorbit_readalong_policy()
+        if policy == 'ignore':
+            return
+
+        ebook_client = self.sync_clients.get('BookOrbit')
+        audio_client = self.sync_clients.get('BookOrbitAudio')
+        if ebook_client is None or audio_client is None:
+            return
+
+        try:
+            ebook_entry = ebook_client.resolve_bookorbit_book_id(book)
+            audio_entry = audio_client.resolve_bookorbit_book_id(book)
+        except Exception as e:
+            logger.debug(f"'{abs_id}' BookOrbit read-along entry resolution failed: {e}", exc_info=True)
+            return
+
+        if ebook_entry is None or audio_entry is None:
+            return
+        if str(ebook_entry) != str(audio_entry):
+            # The common shape: audio and text are separate BookOrbit entries, and
+            # BookOrbit's sync never spans entries. Nothing to defer to.
+            return
+
+        key = f"bookorbit_readalong:{abs_id}"
+        try:
+            sync = ebook_client.client.get_read_aloud_sync(audio_entry)
+        except Exception as e:
+            logger.debug(f"'{abs_id}' BookOrbit readAloudSync lookup failed: {e}", exc_info=True)
+            return
+
+        if not ebook_client.client.read_aloud_sync_is_active(sync):
+            get_persistent_condition_logger().resolve(
+                logger, key,
+                f"🔗 '{abs_id}' '{title_snip}' BookOrbit read-along sync is no longer "
+                f"active on entry {audio_entry} — BookBridge drives both formats again",
+            )
+            return
+
+        if policy == 'takeover':
+            if ebook_client.client.set_read_aloud_sync_mode(audio_entry, 'disabled'):
+                logger.info(
+                    f"🔗 '{abs_id}' '{title_snip}' BOOKORBIT_READALONG_POLICY=takeover — "
+                    f"disabled BookOrbit's read-along sync on entry {audio_entry}; "
+                    f"BookBridge now drives both formats"
+                )
+                return
+            logger.warning(
+                f"⚠️ '{abs_id}' '{title_snip}' Could not disable BookOrbit's read-along sync "
+                f"on entry {audio_entry} — deferring to it for this cycle instead"
+            )
+
+        audio_state.current['_readalong_mirror'] = True
+        get_persistent_condition_logger().warn(
+            logger, key,
+            f"🔗 '{abs_id}' '{title_snip}' BookOrbit read-along sync is active on entry "
+            f"{audio_entry} — writing the ebook side only; the audio position is "
+            f"BookOrbit's mirror of that write, so it cannot lead or be written",
+            level=logging.INFO,
+        )
 
     def _build_text_anchors(self, full_text: str, char_offset: int):
         if not full_text:
@@ -1527,8 +1796,10 @@ class SyncManager:
             return None
 
         normalized = {}
-        abs_ts = config[primary_audio_client].current.get('ts', 0)
-        normalized[primary_audio_client] = abs_ts
+        # The key is present with an explicit None for an unstarted audiobook, so the
+        # `0` default never fires; leader selection subtracts these values downstream.
+        abs_ts = config[primary_audio_client].current.get('ts')
+        normalized[primary_audio_client] = 0 if abs_ts is None else abs_ts
 
         for client_name in ebook_clients:
             if client_name not in self.sync_clients:
@@ -1984,7 +2255,15 @@ class SyncManager:
         return None
 
     def _promote_alignment_backed_book(self, book: Book | None) -> bool:
-        """Repair books whose alignment is stored but whose metadata never finalized."""
+        """Repair books whose alignment is stored but whose metadata never finalized.
+
+        The job-completion write below is scoped to `kind=JOB_KIND_ALIGNMENT`
+        deliberately: this repair is about the alignment-build job, and other
+        job kinds sharing the `jobs` table (read-along EPUB generation) must
+        never be touched here -- an unrelated in-flight job being newer than
+        the real alignment job used to make this method mark it "done"
+        (progress=1.0, error cleared) even though its own worker never ran.
+        """
         if not book or not self.alignment_service:
             return False
 
@@ -2003,7 +2282,7 @@ class SyncManager:
         if changed:
             self.database_service.save_book(book)
 
-        latest_job = self.database_service.get_latest_job(book.abs_id)
+        latest_job = self.database_service.get_latest_job(book.abs_id, kind=JOB_KIND_ALIGNMENT)
         if latest_job and (
             (latest_job.progress or 0.0) < 1.0
             or latest_job.retry_count
@@ -2011,6 +2290,7 @@ class SyncManager:
         ):
             self.database_service.update_latest_job(
                 book.abs_id,
+                kind=JOB_KIND_ALIGNMENT,
                 progress=1.0,
                 retry_count=0,
                 last_error=None,
@@ -2578,8 +2858,8 @@ class SyncManager:
         if not target_book and not had_pending:
             failed_books = self.database_service.get_books_by_status('failed_retry_later')
             for book in failed_books:
-                # Check if this book has a job record and if it's eligible for retry
-                job = self.database_service.get_latest_job(book.abs_id)
+                # This loop drives alignment-worker retry eligibility.
+                job = self.database_service.get_latest_job(book.abs_id, kind=JOB_KIND_ALIGNMENT)
                 if job:
                     retry_count = job.retry_count or 0
                     last_attempt = job.last_attempt or 0
@@ -2800,8 +3080,8 @@ class SyncManager:
                 elif phase == 3:
                     global_pct = 0.9 + (local_pct * 0.1)
 
-                # Save to DB every time for now (or throttle if too frequent)
-                self.database_service.update_latest_job(abs_id, progress=global_pct)
+                # Save to DB every time for now (or throttle if too frequent).
+                self.database_service.update_latest_job(abs_id, kind=JOB_KIND_ALIGNMENT, progress=global_pct)
 
             # --- Heavy Lifting (Blocks this thread, but not the Main thread) ---
             # Step 1: Get EPUB file
@@ -2892,7 +3172,7 @@ class SyncManager:
                 book.status = 'active'
                 persist_book()
 
-                job = self.database_service.get_latest_job(abs_id)
+                job = self.database_service.get_latest_job(abs_id, kind=JOB_KIND_ALIGNMENT)
                 if job:
                     job.retry_count = 0
                     job.last_error = None
@@ -3127,8 +3407,8 @@ class SyncManager:
             book.status = 'active'
             persist_book()
 
-            # Update job record to reset retry count and mark 100%
-            job = self.database_service.get_latest_job(abs_id)
+            # Update the alignment job record to reset retry count and mark 100%.
+            job = self.database_service.get_latest_job(abs_id, kind=JOB_KIND_ALIGNMENT)
             if job:
                 job.retry_count = 0
                 job.last_error = None
@@ -3137,6 +3417,7 @@ class SyncManager:
 
 
             logger.info(f"✅ Completed: {sanitize_log_data(abs_title)}")
+            self._dispatch_readalong_intent(book)
 
         except TranscriptionCancelled:
             # Mapping deleted mid-transcription. The worker stopped cleanly; do not
@@ -3150,8 +3431,8 @@ class SyncManager:
             logger.error(f"❌ {sanitize_log_data(abs_title)}: {e}", exc_info=True)
 
             # --- Failure Update using database service ---
-            # Get current job to increment retry count
-            job = self.database_service.get_latest_job(abs_id)
+            # Get the current alignment job to increment its retry count.
+            job = self.database_service.get_latest_job(abs_id, kind=JOB_KIND_ALIGNMENT)
             current_retry_count = job.retry_count if job else 0
             new_retry_count = current_retry_count + 1
 
@@ -3489,6 +3770,12 @@ class SyncManager:
         vals = {}
         for k, v in config.items():
             client = self.sync_clients[k]
+            # A client another service keeps in step with a position BookBridge
+            # itself wrote holds no independent evidence of where the reader is —
+            # letting it lead would elect our own write-back (see
+            # _mark_bookorbit_readalong_mirror). Shrinks the candidate set only.
+            if v.current.get('_readalong_mirror'):
+                continue
             if client.can_be_leader():
                 pct = v.current.get('pct')
                 if pct is not None:
@@ -3571,7 +3858,9 @@ class SyncManager:
                     if (other_pct > candidate_pct + regression_margin
                             and (other_ts - candidate_ts) > veto_tolerance):
                         if self._peer_position_is_own_writeback(
-                            abs_id, other_name, other_pct, regression_margin
+                            abs_id, other_name, other_pct, regression_margin,
+                            observed_marker=config[other_name].current.get('_position_marker'),
+                            title_snip=title_snip,
                         ):
                             logger.info(
                                 f"🪞 '{abs_id}' '{title_snip}' Rollback veto skipped: "
@@ -3597,6 +3886,10 @@ class SyncManager:
             # selection did not, and in the same cycle would let the very value it had
             # just dismissed as our write-back go on to lead. Same-value match only:
             # a peer the user actually moved no longer matches what we wrote.
+            # A client that reports a position marker (#447) is judged by identity
+            # instead: the service's stored marker either still equals the one we
+            # wrote (echo) or it doesn't (someone else wrote after us), regardless
+            # of how close the two percentages land.
             echo_margin = getattr(self, "sync_delta_between_clients", 0.005)
             for client_name, observed_pct in vals.items():
                 client_echo_margin = (
@@ -3604,7 +3897,9 @@ class SyncManager:
                     else echo_margin
                 )
                 if self._peer_position_is_own_writeback(
-                    abs_id, client_name, observed_pct, client_echo_margin
+                    abs_id, client_name, observed_pct, client_echo_margin,
+                    observed_marker=config[client_name].current.get('_position_marker'),
+                    title_snip=title_snip,
                 ):
                     echo_clients.add(client_name)
             for client_name in sorted(echo_clients):
@@ -4118,10 +4413,14 @@ class SyncManager:
         """Record that BookBridge itself produced this client's current position.
 
         A later cycle reads this client back and sees a freshly stamped position;
-        the marker (client, book, written percentage) is how it tells the echo of
-        our own write from genuine user movement. The percentage comes from the
-        client's own axis via SyncResult.updated_state['pct'], so audio and ebook
-        clients each record a value comparable with what they will report next."""
+        the write-tracker entry (client, book, written percentage, and — when the
+        client supplies one — its opaque position marker, #447) is how it tells
+        the echo of our own write from genuine user movement. The percentage
+        comes from the client's own axis via SyncResult.updated_state['pct'], so
+        audio and ebook clients each record a value comparable with what they
+        will report next. The position marker comes from
+        SyncResult.updated_state['_position_marker'] and is None when the client
+        did not supply one."""
         try:
             if not self._sync_result_was_applied(result):
                 return
@@ -4129,8 +4428,9 @@ class SyncManager:
             pct = updated_state.get('pct') if isinstance(updated_state, dict) else None
             if isinstance(pct, bool) or not isinstance(pct, (int, float)):
                 pct = None
+            marker = updated_state.get('_position_marker') if isinstance(updated_state, dict) else None
             from src.services.write_tracker import record_write
-            record_write(client_name, abs_id, pct)
+            record_write(client_name, abs_id, pct, marker=marker)
         except Exception as e:
             logger.debug(
                 f"Could not record own-write marker for '{client_name}'/'{abs_id}': {e}",
@@ -4544,6 +4844,17 @@ class SyncManager:
                 if not config:
                     continue  # No valid states to process
 
+                # BookOrbit v3 may already be mirroring this book's position between
+                # its own two formats. Decide before leader selection reads the
+                # candidate set or the dispatch loop picks write targets.
+                try:
+                    self._mark_bookorbit_readalong_mirror(book, config, abs_id, title_snip)
+                except Exception as e:
+                    logger.warning(
+                        f"⚠️ '{abs_id}' '{title_snip}' BookOrbit read-along check failed: {e}",
+                        exc_info=True,
+                    )
+
                 # StoryGraph and Hardcover are driven by an idle cooldown rather than the
                 # per-cycle dispatch. Evaluate them for every active book each cycle
                 # (including idle books that early-skip below) so the trailing-edge post
@@ -4649,6 +4960,13 @@ class SyncManager:
 
                 # If nothing changed AND clients are effectively in sync, skip
                 if deltas_zero and not significant_diff:
+                    # ...but a settled part-read book still needs its 'reading'
+                    # status, and settled is its normal condition: a book you are
+                    # part way through and not reading right now never produces a
+                    # delta, so gating this on movement would mean it only ever
+                    # got a status the next time you happened to open it.
+                    # only_if_absent makes this a one-time fill, not per-cycle work.
+                    self._maybe_mark_koreader_reading_from_config(book, config, abs_id, title_snip)
                     logger.debug(f"'{abs_id}' '{title_snip}' No changes and clients in sync, skipping")
                     continue
                 
@@ -4912,6 +5230,14 @@ class SyncManager:
                             # Driven by the idle-cooldown handlers, not the dispatch loop.
                             continue
                         client_state = config.get(client_name)
+                        if client_state and client_state.current.get('_readalong_mirror'):
+                            # BookOrbit mirrors this format from the one we do write;
+                            # writing it too would race its own derived position.
+                            logger.debug(
+                                f"'{abs_id}' '{title_snip}' Skipping '{client_name}' write — "
+                                f"BookOrbit's read-along sync mirrors it from the ebook side"
+                            )
+                            continue
                         if client_state and self._should_skip_deadband_rollback(
                             book, leader, leader_state, client_name, client_state, abs_id, title_snip
                         ):
@@ -5012,12 +5338,24 @@ class SyncManager:
 
                 threshold = self._completion_threshold()
                 previous_leader_pct = getattr(leader_state, 'previous_pct', None)
-                if (
-                    self._completion_propagation_enabled()
-                    and leader_pct is not None
+                crossed_completion = (
+                    leader_pct is not None
                     and leader_pct >= threshold
                     and (previous_leader_pct is None or previous_leader_pct < threshold)
+                )
+                # Deliberately NOT gated on SYNC_COMPLETION_PROPAGATION: telling the
+                # reader devices a book is finished is a different decision from
+                # pushing 100% into every other service, and wanting the first should
+                # not require accepting the second.
+                if crossed_completion:
+                    self._mark_koreader_complete(book, abs_id, title_snip, leader)
+                elif (
+                    leader_pct is not None
+                    and leader_pct > _KOREADER_READING_MIN_PCT
+                    and leader_pct < threshold
                 ):
+                    self._mark_koreader_reading(book, abs_id, title_snip, leader_pct)
+                if crossed_completion and self._completion_propagation_enabled():
                     self._propagate_completion(book, active_clients, leader, abs_id, title_snip)
 
                 # Save states directly to database service using State models
@@ -5390,6 +5728,30 @@ class SyncManager:
                 # Clear states for this book (scoped to the user when given)
                 cleared_count = self.database_service.delete_states_for_book(abs_id, user_id=user_id)
                 logger.info(f"💾 Cleared {cleared_count} state records from database")
+
+                # Tell the reader devices to forget this book's status too, so a
+                # cleared book reads as never opened rather than keeping the
+                # 'complete' that prompted the clear (the usual reason for one is
+                # about to re-read it). This runs BEFORE the KosyncDocument delete
+                # below, which is what resolves the book's document hashes.
+                if env_truthy('KOREADER_STATUS_SYNC_ENABLED', 'true'):
+                    try:
+                        cleared_hashes = self.database_service.record_koreader_status_for_book(
+                            abs_id,
+                            status=self.database_service.KOREADER_STATUS_CLEARED,
+                            device_key='bridge',
+                            user_id=user_id,
+                        )
+                        if cleared_hashes:
+                            logger.info(
+                                f"🧽 KOReader status cleared for {cleared_hashes} document hash(es) "
+                                f"of '{sanitize_log_data(abs_id)}'"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"⚠️ Could not clear KOReader status for '{sanitize_log_data(abs_id)}': {e}",
+                            exc_info=True,
+                        )
 
                 # Delete the shared KOSync document only for an unscoped/global clear
                 # (a per-user clear must not wipe a document other users may share).

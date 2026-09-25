@@ -616,3 +616,73 @@ def test_download_book_returns_content(client):
          patch.object(client, '_make_request', return_value=_Resp(status_code=200, content=b"PK\x03\x04epub")):
         data = client.download_book(3)
     assert data == b"PK\x03\x04epub"
+
+
+# --- Phase 5 read-along delivery additions: get_libraries / scan_library /
+# delete_book_file / get_read_aloud_sync(force=...) -----------------------
+
+def test_get_libraries_returns_list_on_success(client):
+    payload = [{"id": 7, "name": "Audiobooks", "folders": [{"id": 7, "path": "/audiobooks"}]}]
+    with patch.object(client, '_make_request', return_value=_Resp(payload)) as req:
+        libs = client.get_libraries()
+    req.assert_called_once_with("GET", "/api/v1/libraries")
+    assert libs == payload
+
+
+def test_get_libraries_returns_empty_list_on_http_error(client):
+    with patch.object(client, '_make_request', return_value=_Resp(status_code=500)):
+        assert client.get_libraries() == []
+
+
+def test_get_libraries_returns_empty_list_on_no_response(client):
+    with patch.object(client, '_make_request', return_value=None):
+        assert client.get_libraries() == []
+
+
+def test_scan_library_posts_to_scanner_endpoint(client):
+    with patch.object(client, '_make_request', return_value=_Resp(status_code=202)) as req:
+        assert client.scan_library(7) is True
+    req.assert_called_once_with("POST", "/api/v1/scanner/libraries/7/scan")
+
+
+def test_scan_library_returns_false_without_a_library_id(client):
+    with patch.object(client, '_make_request') as req:
+        assert client.scan_library(None) is False
+    req.assert_not_called()
+
+
+def test_scan_library_returns_false_on_http_error(client):
+    with patch.object(client, '_make_request', return_value=_Resp(status_code=500)):
+        assert client.scan_library(7) is False
+
+
+def test_delete_book_file_deletes_by_file_id(client):
+    with patch.object(client, '_make_request', return_value=_Resp(status_code=204)) as req:
+        assert client.delete_book_file(12503) is True
+    req.assert_called_once_with("DELETE", "/api/v1/books/files/12503")
+
+
+def test_delete_book_file_returns_false_without_a_file_id(client):
+    with patch.object(client, '_make_request') as req:
+        assert client.delete_book_file(None) is False
+    req.assert_not_called()
+
+
+def test_delete_book_file_returns_false_on_http_error(client):
+    with patch.object(client, '_make_request', return_value=_Resp(status_code=404)):
+        assert client.delete_book_file(12503) is False
+
+
+def test_get_read_aloud_sync_force_bypasses_cache(client):
+    """force=True must reach get_book_detail with force=True, not the cached detail --
+    a caller polling right after a scan needs fresh data, not up to an hour stale."""
+    with patch.object(client, 'get_book_detail', return_value={"readAloudSync": {"state": "enabled"}}) as mock_detail:
+        sync = client.get_read_aloud_sync(5204, force=True)
+    mock_detail.assert_called_once_with(5204, force=True)
+    assert sync == {"state": "enabled"}
+
+
+def test_get_read_aloud_sync_default_does_not_force(client):
+    with patch.object(client, 'get_book_detail', return_value={"readAloudSync": {"state": "disabled"}}) as mock_detail:
+        client.get_read_aloud_sync(5204)
+    mock_detail.assert_called_once_with(5204, force=False)

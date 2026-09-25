@@ -39,10 +39,13 @@ ALL_SETTINGS = [
     'SYNC_REWIND_HOLD_SECONDS',
     'KOSYNC_HASH_RECONCILE_ENABLED', 'KOSYNC_HASH_RECONCILE_MINUTES',
     'KOSYNC_XPATH_ORDER_ENABLED', 'KOSYNC_FURTHEST_WINS',
+    'KOSYNC_ACTIVE_DEVICE_WINS',
     'KOSYNC_PUT_DEBOUNCE_SECONDS',
     'KOSYNC_BOOKORBIT_DISCOVERY_LIMIT',
     'KOREADER_COMBINE_DEVICE_STATS',
     'KOREADER_ANNOTATION_SYNC',
+    'KOREADER_STATUS_SYNC_ENABLED',
+    'KOREADER_SYNC_READ_HISTORY',
 
     # Storyteller
     'STORYTELLER_ENABLED', 'STORYTELLER_API_URL', 'STORYTELLER_USER', 'STORYTELLER_PASSWORD',
@@ -67,6 +70,10 @@ ALL_SETTINGS = [
     'BOOKORBIT_SHELF_WATCH_ENABLED', 'BOOKORBIT_SHELF_WATCH_NAME',
     'BOOKORBIT_SHELF_WATCH_THRESHOLD', 'BOOKORBIT_SHELF_WATCH_RESCAN_HOURS',
     'BOOKORBIT_ANNOTATION_SYNC_MINUTES', 'BOOKORBIT_KOSYNC_OWNER',
+    'BOOKORBIT_READALONG_POLICY',
+
+    # Read-along EPUB 3 generation
+    'READALONG_AUDIO_BITRATE',
 
     # Kavita
     'KAVITA_ENABLED', 'KAVITA_SERVER', 'KAVITA_WEB_URL', 'KAVITA_API_KEY',
@@ -162,7 +169,7 @@ ALL_SETTINGS = [
     'JOB_MAX_RETRIES', 'JOB_RETRY_DELAY_MINS', 'WHISPER_MODEL',
     'WHISPER_DEVICE', 'WHISPER_COMPUTE_TYPE',
     'TRANSCRIPTION_PROVIDER', 'DEEPGRAM_API_KEY', 'DEEPGRAM_MODEL', 'WHISPER_CPP_URL', 'WHISPER_CPP_TIMEOUT', 'WHISPER_CPP_SEND_ORIGINAL', 'WHISPER_CPP_CHUNK_MINUTES',
-    'CTC_ENABLED', 'CTC_MODEL', 'CTC_DEVICE',
+    'CTC_ENABLED', 'CTC_MODEL', 'CTC_QUARTZNET_MODEL_PATH', 'CTC_DEVICE',
     'ALIGNMENT_SEGMENTED_MAPS',
     'CONTENT_MATCH_GUARD', 'CONTENT_MATCH_MIN_OVERLAP',
     'AUDIO_SPLIT_DURATION_MINUTES',
@@ -213,9 +220,13 @@ DEFAULT_CONFIG = {
     'WHISPER_CPP_TIMEOUT': '600',
     'WHISPER_CPP_SEND_ORIGINAL': 'false',
     'WHISPER_CPP_CHUNK_MINUTES': '0',
-    # CTC forced alignment (opt-in; needs the CTC-enabled image with torch/torchaudio).
-    'CTC_ENABLED': 'false',
-    'CTC_MODEL': 'mms_fa',
+    # Forced (CTC) alignment, the recommended alignment method: 'quartznet' runs on
+    # the CPU in every image (onnxruntime, English); 'mms_fa' needs the -ctc image
+    # with torch/torchaudio. Books it cannot align fall back to transcription.
+    'CTC_ENABLED': 'true',
+    'CTC_MODEL': 'quartznet',
+    # Optional local QuartzNet model.onnx (or its folder); empty downloads it once.
+    'CTC_QUARTZNET_MODEL_PATH': '',
     'CTC_DEVICE': 'auto',
     # Per-chapter RANSAC segment placement (issue #426 phase 2), replacing the global
     # monotonic LIS filter only for books whose narration order genuinely differs from
@@ -255,6 +266,8 @@ DEFAULT_CONFIG = {
     'KOSYNC_AUTO_MAP_ON_AGREEMENT': 'true',
     'KOREADER_COMBINE_DEVICE_STATS': 'true',
     'KOREADER_ANNOTATION_SYNC': 'true',
+    'KOREADER_STATUS_SYNC_ENABLED': 'true',
+    'KOREADER_SYNC_READ_HISTORY': 'false',
     'KOSYNC_PUT_DEBOUNCE_SECONDS': '300',
     'KOSYNC_RECENT_EXTERNAL_PUT_SECONDS': '600',
     # Issue #215 phase 0 (instrumentation only): how long an externally
@@ -288,6 +301,10 @@ DEFAULT_CONFIG = {
     'KOSYNC_HASH_RECONCILE_ENABLED': 'true',
     'KOSYNC_XPATH_ORDER_ENABLED': 'false',
     'KOSYNC_FURTHEST_WINS': 'true',
+    # off | shadow | on. Ships as 'shadow': the arbiter runs and logs the choice it
+    # would have made without changing what any reader receives, so the decision can
+    # be judged against real multi-device traffic before it takes effect.
+    'KOSYNC_ACTIVE_DEVICE_WINS': 'shadow',
     'KOSYNC_HASH_RECONCILE_MINUTES': '360',
     'KOSYNC_BOOKORBIT_DISCOVERY_LIMIT': '40',
     'STORYTELLER_ENABLED': 'false',
@@ -333,6 +350,12 @@ DEFAULT_CONFIG = {
     'BOOKORBIT_SHELF_WATCH_RESCAN_HOURS': '24',
     'BOOKORBIT_ANNOTATION_SYNC_MINUTES': '15',
     'BOOKORBIT_KOSYNC_OWNER': '',
+    'BOOKORBIT_READALONG_POLICY': 'defer',
+    # 32kbps mono AAC -- see src/services/readalong_builder.py's
+    # _DEFAULT_AUDIO_BITRATE (must match), which documents the reference
+    # data point (Storyteller ships 141MB for a 10.1h book, ~31kbps) behind
+    # this default.
+    'READALONG_AUDIO_BITRATE': '32k',
     'KAVITA_ENABLED': 'false',
     'KAVITA_SERVER': '',
     'KAVITA_WEB_URL': '',

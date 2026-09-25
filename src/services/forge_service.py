@@ -61,6 +61,9 @@ class ForgeService:
         self.alignment_service = alignment_service
         self.active_tasks = set()
         self.lock = threading.Lock()
+        self.readalong_epub_worker = None
+        self.readalong_generation_admitter = None
+        self.readalong_generation_releaser = None
         
         # Load environment variables
         self.ABS_API_TOKEN = os.environ.get("ABS_KEY")
@@ -181,6 +184,9 @@ class ForgeService:
         )
         worker.active_tasks = self.active_tasks
         worker.lock = self.lock
+        worker.readalong_epub_worker = self.readalong_epub_worker
+        worker.readalong_generation_admitter = self.readalong_generation_admitter
+        worker.readalong_generation_releaser = self.readalong_generation_releaser
         worker.ABS_API_TOKEN = getattr(worker.abs_client, "token", self.ABS_API_TOKEN)
         worker.ABS_API_URL = getattr(worker.abs_client, "base_url", self.ABS_API_URL)
         return worker
@@ -244,6 +250,241 @@ class ForgeService:
             except Exception as e:
                 logger.warning(f"Auto-Forge: StoryGraph automatch failed for '{book.abs_id}': {e}", exc_info=True)
 
+    def generate_readalong_if_requested(self, book) -> None:
+        """Start read-along generation for ``book`` if it was matched with that
+        request, and consume the request.
+
+        The single dispatcher for both ways a book finishes aligning: this
+        service's own forge completion, and ``SyncManager``'s background
+        alignment job, which is the Storyteller-free Match All path. See
+        ``_maybe_generate_readalong_epub``.
+        """
+        self._maybe_generate_readalong_epub(book)
+
+    def _maybe_generate_readalong_epub(self, book) -> None:
+        """Fire read-along EPUB generation if `book` was queued with that intent.
+
+        Generation needs a
+        finished alignment map, which does not exist at match time, so a new match
+        only records an intent (``Book.readalong_epub_requested``) and this
+        post-forge hook is where it actually fires. The intent lives in a DB
+        column rather than in-memory state specifically because forging can take
+        a long time and the container can restart in between match and forge
+        completion; ``consume_readalong_epub_intent`` reads and clears it in the
+        same atomic UPDATE, so it fires **exactly once** -- a later re-forge of
+        the same book (manual re-forge, a restart-triggered resume) never
+        regenerates from a stale flag, regardless of whether generation itself
+        goes on to succeed or fail.
+
+        Never lets a problem here reach the caller: this runs from
+        ``_run_forge_match_completion`` right after the forge's own DB write, and
+        a read-along failure must never be mistaken for the forge itself failing,
+        nor touch the mapping the forge just built (see
+        ``_readalong_epub_worker``'s own docstring for that guarantee -- this
+        method is a thin, user-scoped dispatcher onto it, not a second
+        implementation).
+
+        The actual work is handed to its own daemon thread rather than run
+        inline: this method is called from inside ``_auto_forge_background_task``
+        before its ``finally`` clears ``self.active_tasks`` and removes the temp
+        staging dir, and read-along generation can take minutes (the same reason
+        the interactive dashboard action is async). Blocking here would leave the
+        book showing as "still forging" long after it is actually active.
+
+        User-scoped: this executes on ForgeService's own worker thread (started
+        by a plain ``threading.Thread`` in ``_auto_forge_background_task``),
+        which -- like every plain thread in this codebase -- starts with no
+        ambient contextvars, regardless of whether the forge was triggered from
+        a request or from a queued background batch (CLAUDE.md failure mode #5;
+        confirmed by reading the call chain rather than assumed: neither
+        ``start_auto_forge_match`` nor ``_spawn_user_background`` copies
+        contextvars across the thread boundary they each introduce). BookOrbit
+        credentials are per-user, so ``book.user_id`` -- set via
+        ``_claim_book_for_user_id`` at queue time, long before forging started --
+        is the only reliable source for which user's clients/credentials to bind
+        for the duration of the call, mirroring
+        ``ClientPoller._run_shelf_watch_for_user``'s own copy of this pattern.
+        """
+        abs_id = getattr(book, "abs_id", None)
+        if not abs_id or not self.database_service:
+            return
+
+        admit = self.readalong_generation_admitter
+        release = self.readalong_generation_releaser
+        if admit is None or release is None:
+            logger.error(
+                "Read-along EPUB: runtime admission callbacks are not configured for '%s'",
+                abs_id,
+            )
+            return
+        if not admit(abs_id):
+            logger.info("Read-along EPUB: generation already active for '%s'; skipping duplicate post-forge request", abs_id)
+            return
+
+        try:
+            if not self.database_service.consume_readalong_epub_intent(abs_id):
+                release(abs_id)
+                return
+        except Exception as e:
+            logger.error(
+                "Read-along EPUB: could not read/consume generation intent for '%s': %s",
+                abs_id, e, exc_info=True,
+            )
+            release(abs_id)
+            return
+
+        if getattr(book, "audio_source", None) != "BookOrbit":
+            # Shouldn't happen -- the intent is only ever recorded for a
+            # BookOrbit-audio queue item -- but the book row can change between
+            # match and forge completion, so refuse rather than generate against
+            # the wrong audio source.
+            logger.warning(
+                "Read-along EPUB: intent found for '%s' but audio_source is '%s', not BookOrbit; skipping",
+                abs_id, getattr(book, "audio_source", None),
+            )
+            release(abs_id)
+            return
+
+        align_method = None
+        try:
+            align_method = self.database_service.get_alignment_method(abs_id)
+        except Exception as e:
+            logger.warning(
+                "Read-along EPUB: could not read alignment method for '%s': %s", abs_id, e, exc_info=True,
+            )
+        if (align_method or "") not in ("ctc", "lexical", "lexical_timed"):
+            logger.info(
+                "Read-along EPUB: skipping '%s' -- forge produced alignment method '%s', not eligible",
+                abs_id, align_method or "none",
+            )
+            release(abs_id)
+            return
+
+        logger.info("📖 Read-along EPUB: generation intent consumed for '%s'; starting", abs_id)
+
+        job_id = None
+        try:
+            from src.db.models import Job, JOB_KIND_READALONG
+            # Must carry the read-along kind. Untagged it defaults to
+            # 'alignment', which breaks this row twice over: a normal sync's
+            # _promote_alignment_backed_book would mark it complete without the
+            # worker ever running, and the worker's own kind-scoped
+            # update_latest_job calls would not find it, so its real progress
+            # and failures would silently no-op.
+            job = self.database_service.save_job(
+                Job(
+                    abs_id=abs_id, last_attempt=time.time(), retry_count=0,
+                    progress=0.0, last_error=None, kind=JOB_KIND_READALONG,
+                )
+            )
+            # Keep the row id so progress writes stay bound to this attempt.
+            job_id = getattr(job, "id", None)
+        except Exception as e:
+            logger.warning(
+                "Read-along EPUB: could not record a job row for '%s'; proceeding without status tracking: %s",
+                abs_id, e, exc_info=True,
+            )
+
+        user_id = getattr(book, "user_id", None)
+        try:
+            threading.Thread(
+                target=self._run_readalong_epub_after_forge,
+                args=(abs_id, user_id, job_id),
+                daemon=True,
+                name=f"readalong-epub-{abs_id}",
+            ).start()
+        except Exception as e:
+            if job_id is not None:
+                try:
+                    self.database_service.update_job_by_id(
+                        job_id, last_error=f"Read-along generation failed to start: {e}",
+                    )
+                except Exception as update_error:
+                    logger.debug("Read-along: could not record start failure for '%s': %s", abs_id, update_error)
+            release(abs_id)
+            logger.error(
+                "Read-along EPUB: could not start generation for '%s': %s",
+                abs_id, e, exc_info=True,
+            )
+
+    def _run_readalong_epub_after_forge(self, abs_id: str, user_id, job_id=None) -> None:
+        """Worker thread body: bind the owning user's context, then run the
+        existing Phase 6a worker. See ``_maybe_generate_readalong_epub`` for why
+        this needs its own thread and its own ambient-context binding.
+
+        ``job_id`` is forwarded straight through to ``_readalong_epub_worker``;
+        it is ``None`` when
+        ``_maybe_generate_readalong_epub``'s own best-effort ``save_job`` call
+        failed, in which case the worker skips every job-state write rather
+        than guessing at an ambiguous "latest" row."""
+        uid_token = None
+        creds_token = None
+        worker_started = False
+
+        def _mark_failure(message: str) -> None:
+            if job_id is None:
+                return
+            try:
+                self.database_service.update_job_by_id(job_id, last_error=message)
+            except Exception as update_error:
+                logger.debug("Read-along: could not record worker failure for '%s': %s", abs_id, update_error)
+
+        try:
+            from src.utils.user_context import (
+                set_current_user_id, reset_current_user_id,
+                set_current_user_credentials, reset_current_user_credentials,
+            )
+            if user_id is not None:
+                try:
+                    uid_token = set_current_user_id(user_id)
+                except Exception as e:
+                    logger.debug("Read-along EPUB: could not bind ambient user id for '%s': %s", abs_id, e)
+                try:
+                    from src.utils.user_config import _ALLOW_GLOBAL_FALLBACK_KEY, global_fallback_allowed
+                    creds = dict(self.database_service.get_user_credentials(user_id) or {})
+                    user = self.database_service.get_user(user_id)
+                    creds[_ALLOW_GLOBAL_FALLBACK_KEY] = global_fallback_allowed(self.database_service, user)
+                    creds_token = set_current_user_credentials(creds)
+                except Exception as e:
+                    logger.debug("Read-along EPUB: could not bind ambient credentials for '%s': %s", abs_id, e)
+            else:
+                logger.warning(
+                    "Read-along EPUB: '%s' has no owning user_id; generation will run against "
+                    "the global/admin client bundle",
+                    abs_id,
+                )
+
+            worker = self.readalong_epub_worker
+            if worker is None:
+                logger.error(
+                    "Read-along EPUB: runtime worker callback is not configured for '%s'",
+                    abs_id,
+                )
+                _mark_failure("Read-along generation worker is not configured")
+                return
+            worker_started = True
+            worker(abs_id, job_id)
+        except Exception as e:
+            logger.error(
+                "❌ Read-along EPUB: post-forge generation failed for '%s': %s", abs_id, e, exc_info=True,
+            )
+            _mark_failure(f"Unexpected error: {e}")
+        finally:
+            release = self.readalong_generation_releaser
+            # The web worker owns the reservation once handed the job. This
+            # wrapper only owns cleanup before handoff.
+            if not worker_started and release is not None:
+                release(abs_id)
+            elif not worker_started:
+                logger.error(
+                    "Read-along EPUB: runtime release callback is not configured for '%s'",
+                    abs_id,
+                )
+            if creds_token is not None:
+                reset_current_user_credentials(creds_token)
+            if uid_token is not None:
+                reset_current_user_id(uid_token)
+
     def _update_forge_match_job(self, abs_id: str, progress: float = None, last_error: str = None) -> None:
         """Best-effort durable progress marker for Forge & Match waits."""
         if not abs_id or not self.database_service:
@@ -254,9 +495,9 @@ class ForgeService:
         if last_error is not None:
             updates["last_error"] = last_error
         try:
-            updated = self.database_service.update_latest_job(abs_id, **updates)
+            from src.db.models import Job, JOB_KIND_ALIGNMENT
+            updated = self.database_service.update_latest_job(abs_id, kind=JOB_KIND_ALIGNMENT, **updates)
             if not updated:
-                from src.db.models import Job
                 self.database_service.save_job(
                     Job(
                         abs_id=abs_id,
@@ -1778,6 +2019,7 @@ class ForgeService:
                 self._update_forge_match_job(abs_id, progress=1.0, last_error=None)
                 logger.info(f"✅ Auto-Forge: Book {abs_id} updated successfully!")
                 self._automatch_progress_trackers(book)
+                self._maybe_generate_readalong_epub(book)
             else:
                 logger.error(f"❌ Auto-Forge: Book {abs_id} not found in DB to update!")
 

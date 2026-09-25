@@ -37,7 +37,7 @@ from src.utils.user_config import (
 )
 from src.utils.string_utils import calculate_similarity, clean_book_title
 from src.utils.ebook_sources import is_grimmory_source
-from src.services import observation_trail
+from src.services import kosync_device_arbiter, observation_trail
 from src.services.llm_matching import judge_best_candidate
 from src.db.models import State
 
@@ -113,6 +113,16 @@ _kosync_recent_external_puts_lock = threading.Lock()
 _KOREADER_STATS_MAX_BOOKS = 1000
 _KOREADER_STATS_MAX_PAGE_STATS = 10000
 _KOREADER_STATS_MERGE_LIMIT = 10000
+_KOREADER_STATUS_MAX_BOOKS = 5000
+_KOREADER_STATUS_MERGE_LIMIT = 5000
+# KOReader's own vocabulary for sidecar summary.status. An unknown value is
+# rejected rather than stored: these strings are written straight back into a
+# device's sidecar, and a typo there is a status the reader can never clear.
+_KOREADER_STATUS_VALUES = frozenset({'reading', 'complete', 'abandoned'})
+# 'unread' is the bridge's CLEAR sentinel, not a KOReader status: a device applying
+# it removes the sidecar's status. Devices may RECEIVE it but must never report it,
+# so it is accepted on the merged response and refused on upload.
+_KOREADER_STATUS_CLEARED = 'unread'
 _BRIDGESYNC_LOG_MAX_LINES = 200
 _BRIDGESYNC_LOG_MAX_LINE_CHARS = 1000
 _BRIDGESYNC_LOG_MAX_PAYLOAD_BYTES = 64 * 1024
@@ -791,6 +801,57 @@ def _is_internal_kosync_device(device: str | None, device_id: str | None = None)
     )
 
 
+def _record_external_kosync_observation(kosync_doc, percentage, device: str | None, user_id) -> None:
+    """Record one device-reported position on the book's observation trail.
+
+    Called before furthest-wins decides anything, so a report the guard goes on to
+    reject still counts as evidence of where that reader is.
+    """
+    linked_abs_id = getattr(kosync_doc, "linked_abs_id", None) if kosync_doc else None
+    if not linked_abs_id:
+        return
+    try:
+        observation_trail.record_observation(
+            "KoSync", linked_abs_id, percentage, source="put",
+            user_id=user_id, device=device or "",
+        )
+    except Exception as trail_err:
+        logger.debug(f"Could not record KoSync observation: {trail_err}", exc_info=True)
+
+
+def _backward_move_is_corroborated(kosync_doc, device: str | None, user_id) -> bool:
+    """Whether this DEVICE has proved a backward move by reading on from it.
+
+    Furthest-wins defends one device's position against another's, and the only thing
+    that tells a deliberate rewind apart from a stale reader being opened is what the
+    device does NEXT — which is exactly what the trail records. So ask it about this
+    device alone: a second device reporting where it already sits must never answer
+    for the reader who actually moved. One report is what opening a stale reader looks
+    like, and never qualifies.
+    """
+    if not env_truthy("SYNC_TRUST_CORROBORATED_REWIND", "true"):
+        return False
+    linked_abs_id = getattr(kosync_doc, "linked_abs_id", None) if kosync_doc else None
+    if not linked_abs_id or not device:
+        return False
+    try:
+        corroboration = observation_trail.evaluate(
+            "KoSync", linked_abs_id, user_id=user_id, device=device,
+        )
+    except Exception as trail_err:
+        logger.warning(
+            "KOSync: could not evaluate rewind corroboration for %s: %s",
+            linked_abs_id, trail_err, exc_info=True,
+        )
+        return False
+    if corroboration.corroborated:
+        logger.info(
+            "KOSync: rewind corroboration for '%s' on %s — %s",
+            device, linked_abs_id, corroboration.describe(),
+        )
+    return corroboration.corroborated
+
+
 def _get_kosync_device_key(device: str | None, device_id: str | None) -> str:
     normalized_device_id = (device_id or "").strip()
     if normalized_device_id:
@@ -1298,15 +1359,31 @@ def kosync_users_auth():
 @kosync_sync_bp.route('/users/create', methods=['POST'])
 @kosync_sync_bp.route('/koreader/users/create', methods=['POST'])
 def kosync_users_create():
-    """Stub for KOReader user registration.
+    """KOReader user registration check.
 
     BookBridge manages accounts in its web UI, not via KOReader registration, so
-    this only acknowledges the request. It echoes back the *requested* username
-    (never the server's configured KOSYNC_USER) to avoid disclosing credentials
-    to an unauthenticated caller.
+    nothing is created here. It succeeds only when the username/password already
+    match configured KoSync credentials (global or per-user), exactly like
+    /users/login. Acknowledging any other name would tell the client the account
+    exists and every following /users/auth would fail (#446). It echoes back the
+    *requested* username (never the server's configured KOSYNC_USER) to avoid
+    disclosing credentials to an unauthenticated caller.
     """
     data = request.get_json(silent=True) or {}
     requested = data.get("username") or request.form.get("username") or ""
+    password = data.get("password") or request.form.get("password") or ""
+
+    authenticated, _ = authenticate_kosync(requested, password)
+    if not authenticated:
+        logger.warning(
+            f"⚠️ KOSync Create: Registration refused for unconfigured user '{requested}' from "
+            f"'{request.remote_addr}' — accounts are set up in BookBridge Settings, then use Login"
+        )
+        return jsonify({
+            "message": "BookBridge does not create accounts from the reader. Set your KoSync "
+                       "username and password in BookBridge Settings, then use Login."
+        }), 401
+
     return jsonify({"username": requested}), 201
 
 
@@ -1813,6 +1890,14 @@ def kosync_put_progress():
         baseline_device, baseline_device_id
     )
 
+    # Record what the device said BEFORE furthest-wins can reject it. A rejected
+    # report is still a true observation of where that reader is, and recording it
+    # only after the gate made the corroborated-rewind rule unreachable for a second
+    # device: proving the rewind needs observations, observations needed accepted
+    # PUTs, and the PUTs were rejected for being the rewind (issue #215).
+    if not is_internal:
+        _record_external_kosync_observation(kosync_doc, percentage, device, request_user_id)
+
     if (
         furthest_wins
         and baseline_pct
@@ -1828,6 +1913,13 @@ def kosync_put_progress():
                     f"({baseline_pct:.2%} -> {new_pct:.2%}): the higher position was never "
                     f"claimed by another device (stored device_id="
                     f"{baseline_device_id or 'none'}), so furthest-wins has no peer to defend"
+                )
+            elif _backward_move_is_corroborated(kosync_doc, device, request_user_id):
+                logger.info(
+                    f"KOSync: Allowing rewind from '{device}' for doc {doc_hash} "
+                    f"({baseline_pct:.2%} -> {new_pct:.2%}): that device has kept reading on "
+                    f"from the new position, which is what separates a deliberate rewind "
+                    f"from a stale reader simply being opened"
                 )
             else:
                 logger.info(f"KOSync: Ignored progress from '{device}' for doc {doc_hash} (user has higher: {baseline_pct:.2f}% vs new {new_pct:.2f}%)")
@@ -1874,17 +1966,8 @@ def kosync_put_progress():
     _database_service.save_kosync_document(kosync_doc)
     if not is_internal:
         _record_recent_external_kosync_put(doc_hash, device, device_id, percentage, now_ts, request_user_id)
-        # A device telling us where it is, in its own words. Instrumentation only for
-        # now — nothing reads the trail to make a decision yet (issue #215 phase 0).
-        linked_abs_id = getattr(kosync_doc, "linked_abs_id", None) if kosync_doc else None
-        if linked_abs_id:
-            try:
-                observation_trail.record_observation(
-                    "KoSync", linked_abs_id, percentage, source="put",
-                    user_id=request_user_id, device=device or "",
-                )
-            except Exception as trail_err:
-                logger.debug(f"Could not record KoSync observation: {trail_err}", exc_info=True)
+        # The observation was recorded before the furthest-wins gate, so that a report
+        # the guard rejects still counts toward proving a later rewind.
         # Per-user device progress: the durable per-user record for unlinked docs
         # and the furthest-wins / sibling-GET source (no-op for no-accounts installs).
         _database_service.upsert_user_kosync_progress(
@@ -2215,7 +2298,107 @@ def koreader_merged_statistics():
         "books": books_meta,
         "watermark": merged.get("watermark"),
         "truncated": bool(merged.get("truncated")),
+        # Whether the device should also file these merged reads into KOReader's
+        # own reading history. That list is per-device by design ("books I opened
+        # here"), so widening it to "books I read anywhere" is opt-in.
+        "merge_history": env_truthy("KOREADER_SYNC_READ_HISTORY", "false"),
     }), 200
+
+
+@kosync_sync_bp.route('/device-sync/status', methods=['POST'])
+@kosync_sync_bp.route('/koreader/device-sync/status', methods=['POST'])
+@kosync_auth_required
+def koreader_upload_book_status():
+    """Receive each device's sidecar reading statuses (summary.status)."""
+    if not env_truthy("KOREADER_STATUS_SYNC_ENABLED", "true"):
+        return jsonify({"enabled": False, "accepted": 0}), 200
+
+    data = request.json
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "Expected JSON object"}), 400
+
+    books = data.get("books")
+    if not isinstance(books, list):
+        return jsonify({"error": "Expected 'books' array"}), 400
+    if len(books) > _KOREADER_STATUS_MAX_BOOKS:
+        return jsonify({"error": f"Too many books in status upload (max {_KOREADER_STATUS_MAX_BOOKS})"}), 413
+
+    device = str(data.get("device") or "").strip()
+    device_id = str(data.get("device_id") or "").strip()
+    if not (device_id or device).strip():
+        return jsonify({"error": "Missing device identity"}), 400
+
+    if not _database_service:
+        return jsonify({"error": "Database service unavailable"}), 503
+
+    accepted_rows = []
+    rejected = 0
+    for book in books:
+        if not isinstance(book, dict):
+            rejected += 1
+            continue
+        status = str(book.get("status") or "").strip().lower()
+        if status not in _KOREADER_STATUS_VALUES:
+            # Includes KOReader's empty status, which carries no decision.
+            rejected += 1
+            continue
+        accepted_rows.append({
+            "md5": book.get("md5"),
+            "status": status,
+            "modified": book.get("modified"),
+        })
+
+    user_id = getattr(g, "kosync_user_id", None)
+    try:
+        accepted = _database_service.upsert_koreader_book_status(
+            device=device,
+            device_id=device_id,
+            books=accepted_rows,
+            user_id=user_id,
+        )
+    except Exception as e:
+        logger.error(
+            "KOReader status upload failed for device '%s': %s",
+            (device_id or device), e, exc_info=True,
+        )
+        return jsonify({"error": "Failed to persist status upload"}), 500
+
+    return jsonify({"enabled": True, "accepted": int(accepted or 0), "rejected": rejected}), 200
+
+
+@kosync_sync_bp.route('/device-sync/status/merged', methods=['GET'])
+@kosync_sync_bp.route('/koreader/device-sync/status/merged', methods=['GET'])
+@kosync_auth_required
+def koreader_merged_book_status():
+    """Return the winning reading status per book for the calling user.
+
+    Every known book is returned rather than a per-device delta: the device
+    resolves md5 -> local file through its own hash index and skips anything it
+    already agrees with, so a device that has never reported a book still learns
+    that book's status.
+    """
+    if not env_truthy("KOREADER_STATUS_SYNC_ENABLED", "true"):
+        return jsonify({"enabled": False, "books": []}), 200
+
+    if not _database_service:
+        return jsonify({"error": "Database service unavailable"}), 503
+
+    limit = _KOREADER_STATUS_MERGE_LIMIT
+    limit_raw = request.args.get("limit")
+    if limit_raw:
+        try:
+            limit = max(min(int(limit_raw), _KOREADER_STATUS_MERGE_LIMIT), 1)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid 'limit' value"}), 400
+
+    try:
+        user_id = getattr(g, "kosync_user_id", None)
+        winners = _database_service.resolve_koreader_book_status(user_id=user_id, limit=limit)
+    except Exception as e:
+        logger.error("KOReader merged status fetch failed: %s", e, exc_info=True)
+        return jsonify({"error": "Failed to fetch merged status"}), 500
+
+    return jsonify({"enabled": True, "books": winners}), 200
 
 
 def _annotation_sync_enabled() -> bool:
@@ -3153,6 +3336,56 @@ def _respond_from_book_states(doc_id, book):
         docs_with_progress = eligible_docs
     if docs_with_progress:
         best_doc = max(docs_with_progress, key=lambda d: float(d.percentage))
+        # Furthest-wins is the default answer, but a second device the reader is
+        # demonstrably working through should not be dragged to a row nobody has
+        # touched in weeks. The arbiter decides; in shadow mode it only says what it
+        # would have decided (issue #215, KOSYNC_ACTIVE_DEVICE_WINS).
+        try:
+            choice = kosync_device_arbiter.choose_device_row(
+                docs_with_progress,
+                abs_id=book.abs_id,
+                user_id=user_id,
+                parse_timestamp=parse_service_timestamp,
+                is_internal_device=_is_internal_kosync_device,
+            )
+        except Exception as arbiter_err:
+            logger.warning(
+                "KOSync: device arbiter unavailable for %s: %s", doc_id, arbiter_err, exc_info=True,
+            )
+            choice = None
+        if choice is not None and choice.overrides_furthest:
+            mode = kosync_device_arbiter.arbiter_mode()
+            logger.info(
+                "🎯 KOSync: device arbiter (%s) for %s — %s", mode, doc_id, choice.reason,
+            )
+            if mode == kosync_device_arbiter.MODE_ON:
+                # Answer with the proven reader directly. Feeding it through the
+                # furthest-wins gate below would discard it again: the synced State
+                # holds the very position the stale row put there, so the reader who
+                # is actually reading is never "ahead" of it. Choosing current over
+                # furthest IS the policy this mode enables.
+                arbiter_doc = choice.row
+                poison_pill = _suppress_empty_progress_response(
+                    doc_id, float(arbiter_doc.percentage), arbiter_doc.progress
+                )
+                if poison_pill is not None:
+                    return poison_pill
+                response_data = {
+                    "device": "abs-kosync-bridge",
+                    "device_id": "abs-kosync-bridge",
+                    "document": doc_id,
+                    "percentage": float(arbiter_doc.percentage),
+                    "progress": arbiter_doc.progress or "",
+                    "timestamp": int(datetime_to_epoch(arbiter_doc.timestamp)) if arbiter_doc.timestamp else 0,
+                }
+                response_data.update(
+                    _recent_external_kosync_put_metadata(
+                        arbiter_doc.document_hash,
+                        response_data["percentage"],
+                        user_id,
+                    )
+                )
+                return jsonify(response_data), 200
         # Furthest-wins: only hand back the device's own position when it is genuinely
         # ahead of the bridge-synced position. The bridge's internal sync-push advances
         # the synced State but not this per-user row, so a device that is *behind* (the

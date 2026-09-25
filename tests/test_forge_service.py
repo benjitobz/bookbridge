@@ -814,6 +814,31 @@ class TestForgeService(unittest.TestCase):
 
         self.assertEqual(db_book.status, "error")
 
+    def test_auto_forge_completion_fires_readalong_hook_on_success(self):
+        """Wires _maybe_generate_readalong_epub into the real completion path
+        (Phase 6b) -- the same place _automatch_progress_trackers already
+        runs, right after the successful DB write."""
+        with patch.object(self.service, "_maybe_generate_readalong_epub") as mock_hook:
+            db_book = self._run_auto_forge_pipeline(
+                text_item={"source": "Local File"},
+                ingest_manifest=None,
+                storyteller_alignment_ok=False,
+                smil_transcript=[{"start": 0.0, "end": 1.0, "text": "from smil"}],
+                whisper_transcript=None,
+            )
+        mock_hook.assert_called_once_with(db_book)
+
+    def test_auto_forge_completion_does_not_fire_readalong_hook_on_pipeline_failure(self):
+        with patch.object(self.service, "_maybe_generate_readalong_epub") as mock_hook:
+            self._run_auto_forge_pipeline(
+                text_item={"source": "Local File"},
+                ingest_manifest=None,
+                storyteller_alignment_ok=False,
+                smil_transcript=[],
+                whisper_transcript=[],
+            )
+        mock_hook.assert_not_called()
+
     def test_auto_forge_booklore_hardlink_mode_forwards_to_booklore_staging(self):
         with patch.object(self.service, "_copy_booklore_audio_files", return_value=True) as mock_copy_booklore, patch.object(
             self.service, "_copy_audio_files", return_value=True
@@ -1349,6 +1374,294 @@ class TestForgeAutomatchProgressTrackers(unittest.TestCase):
         book = MagicMock()
         service._automatch_progress_trackers(book)
         storygraph._automatch_storygraph.assert_called_once_with(book)
+
+
+class TestMaybeGenerateReadalongEpub(unittest.TestCase):
+    """The post-forge hook
+    that fires read-along generation when a new match was queued with that
+    intent. `_maybe_generate_readalong_epub` is the decision layer (consume the
+    once-only intent, check cheap eligibility, hand off); the actual work is
+    Phase 6a's own `_readalong_epub_worker`, exercised separately in
+    tests/test_readalong_epub_action.py -- not duplicated here."""
+
+    def _service(self):
+        mock_db = MagicMock()
+        service = ForgeService(
+            database_service=mock_db,
+            abs_client=MagicMock(),
+            booklore_client=MagicMock(),
+            storyteller_client=MagicMock(),
+            library_service=MagicMock(),
+            ebook_parser=MagicMock(),
+            transcriber=MagicMock(),
+            alignment_service=MagicMock(),
+        )
+        service.readalong_generation_admitter = lambda _abs_id: True
+        service.readalong_generation_releaser = lambda _abs_id: None
+        return service, mock_db
+
+    def _book(self, **overrides):
+        book = SimpleNamespace(
+            abs_id="abs-1",
+            audio_source="BookOrbit",
+            user_id=7,
+            ebook_filename="original.epub",
+            original_ebook_filename="original.epub",
+        )
+        for key, value in overrides.items():
+            setattr(book, key, value)
+        return book
+
+    def test_job_row_is_tagged_with_the_readalong_kind(self):
+        """The Job this hook saves must carry JOB_KIND_READALONG.
+
+        Untagged it defaults to JOB_KIND_ALIGNMENT, which breaks the row twice
+        over: SyncManager._promote_alignment_backed_book marks it complete on an
+        ordinary sync without the worker ever running, and the worker's own
+        kind-scoped update_latest_job calls never match it, so real progress and
+        failures silently no-op. This gap survived the Job-kind fix because
+        forge_service.py was owned by a different agent at the time.
+        """
+        from src.db.models import JOB_KIND_READALONG
+
+        service, mock_db = self._service()
+        mock_db.consume_readalong_epub_intent.return_value = True
+        mock_db.get_alignment_method.return_value = "ctc"
+
+        with patch.object(service, "_run_readalong_epub_after_forge"),                 patch("threading.Thread"):
+            service._maybe_generate_readalong_epub(self._book())
+
+        mock_db.save_job.assert_called_once()
+        saved = mock_db.save_job.call_args[0][0]
+        self.assertEqual(saved.kind, JOB_KIND_READALONG)
+
+    def test_noop_when_no_intent_recorded(self):
+        """The common case: most forges never had the checkbox ticked."""
+        service, mock_db = self._service()
+        mock_db.consume_readalong_epub_intent.return_value = False
+        with patch("src.services.forge_service.threading.Thread") as mock_thread:
+            service._maybe_generate_readalong_epub(self._book())
+        mock_db.consume_readalong_epub_intent.assert_called_once_with("abs-1")
+        mock_thread.assert_not_called()
+        mock_db.save_job.assert_not_called()
+
+    def test_postforge_shares_manual_admission_reservation(self):
+        """The post-forge hook observes the same reservation as the route."""
+        import src.web_server as ws
+
+        with ws._READALONG_GENERATION_LOCK:
+            ws._ACTIVE_READALONG_GENERATIONS.clear()
+        self.assertTrue(ws._claim_readalong_generation("abs-1"))
+        service, mock_db = self._service()
+        service.readalong_generation_admitter = ws._claim_readalong_generation
+        service.readalong_generation_releaser = ws._release_readalong_generation
+        mock_db.consume_readalong_epub_intent.return_value = True
+        mock_db.get_alignment_method.return_value = "ctc"
+        with patch("src.services.forge_service.threading.Thread") as mock_thread:
+            service._maybe_generate_readalong_epub(self._book())
+        mock_db.consume_readalong_epub_intent.assert_not_called()
+        mock_thread.assert_not_called()
+        ws._release_readalong_generation("abs-1")
+        mock_db.get_alignment_method.assert_not_called()
+
+    def test_noop_when_audio_source_not_bookorbit(self):
+        service, mock_db = self._service()
+        mock_db.consume_readalong_epub_intent.return_value = True
+        with patch("src.services.forge_service.threading.Thread") as mock_thread:
+            service._maybe_generate_readalong_epub(self._book(audio_source="ABS"))
+        mock_thread.assert_not_called()
+        mock_db.get_alignment_method.assert_not_called()
+
+    def test_noop_when_alignment_method_not_eligible(self):
+        service, mock_db = self._service()
+        mock_db.consume_readalong_epub_intent.return_value = True
+        mock_db.get_alignment_method.return_value = "whisper"
+        with patch("src.services.forge_service.threading.Thread") as mock_thread:
+            service._maybe_generate_readalong_epub(self._book())
+        mock_thread.assert_not_called()
+        mock_db.save_job.assert_not_called()
+
+    def test_eligible_for_ctc_lexical_and_lexical_timed(self):
+        """Word-timed lexical alignment is eligible alongside ctc and lexical."""
+        for method in ("ctc", "lexical", "lexical_timed"):
+            with self.subTest(method=method):
+                service, mock_db = self._service()
+                mock_db.consume_readalong_epub_intent.return_value = True
+                mock_db.get_alignment_method.return_value = method
+                mock_db.save_job.return_value = MagicMock(id=55)
+                with patch("src.services.forge_service.threading.Thread") as mock_thread:
+                    service._maybe_generate_readalong_epub(self._book())
+                mock_thread.assert_called_once()
+                _, kwargs = mock_thread.call_args
+                self.assertEqual(kwargs["target"], service._run_readalong_epub_after_forge)
+                # Forward the created row id for unambiguous status writes.
+                self.assertEqual(kwargs["args"], ("abs-1", 7, 55))
+                self.assertTrue(kwargs["daemon"])
+                mock_thread.return_value.start.assert_called_once()
+
+    def test_eligible_saves_job_row_before_spawning(self):
+        """Pre-creating a Job row mirrors the interactive route
+        (generate_readalong_epub) so the read-along attempt gets its OWN
+        latest-job row rather than overwriting the forge's own just-recorded
+        completion job (progress=1.0, last_error=None) if generation later
+        fails."""
+        service, mock_db = self._service()
+        mock_db.consume_readalong_epub_intent.return_value = True
+        mock_db.get_alignment_method.return_value = "ctc"
+        with patch("src.services.forge_service.threading.Thread"):
+            service._maybe_generate_readalong_epub(self._book())
+        mock_db.save_job.assert_called_once()
+        job = mock_db.save_job.call_args[0][0]
+        self.assertEqual(job.abs_id, "abs-1")
+        self.assertEqual(job.progress, 0.0)
+        self.assertIsNone(job.last_error)
+
+    def test_thread_start_failure_marks_its_job_failed(self):
+        service, mock_db = self._service()
+        mock_db.consume_readalong_epub_intent.return_value = True
+        mock_db.get_alignment_method.return_value = "ctc"
+        mock_db.save_job.return_value = MagicMock(id=55)
+        with patch("src.services.forge_service.threading.Thread", side_effect=RuntimeError("thread failed")):
+            service._maybe_generate_readalong_epub(self._book())
+        mock_db.update_job_by_id.assert_called_once_with(
+            55, last_error="Read-along generation failed to start: thread failed",
+        )
+
+    def test_missing_abs_id_is_noop(self):
+        service, mock_db = self._service()
+        with patch("src.services.forge_service.threading.Thread") as mock_thread:
+            service._maybe_generate_readalong_epub(self._book(abs_id=None))
+        mock_db.consume_readalong_epub_intent.assert_not_called()
+        mock_thread.assert_not_called()
+
+    def test_consume_intent_exception_is_swallowed(self):
+        """Never fail the forge: a DB error while checking/consuming the
+        intent must not raise out of this method."""
+        service, mock_db = self._service()
+        mock_db.consume_readalong_epub_intent.side_effect = RuntimeError("db down")
+        with patch("src.services.forge_service.threading.Thread") as mock_thread:
+            service._maybe_generate_readalong_epub(self._book())  # must not raise
+        mock_thread.assert_not_called()
+
+    def test_never_touches_ebook_filename_fields(self):
+        """KOReader must keep receiving the original EPUB on every path."""
+        service, mock_db = self._service()
+        mock_db.consume_readalong_epub_intent.return_value = True
+        mock_db.get_alignment_method.return_value = "ctc"
+        book = self._book()
+        with patch("src.services.forge_service.threading.Thread"):
+            service._maybe_generate_readalong_epub(book)
+        self.assertEqual(book.ebook_filename, "original.epub")
+        self.assertEqual(book.original_ebook_filename, "original.epub")
+
+
+class TestRunReadalongEpubAfterForge(unittest.TestCase):
+    """The thread body `_maybe_generate_readalong_epub` hands off to: binds the
+    owning user's ambient context (forge's own background thread has none --
+    CLAUDE.md failure mode #5), calls Phase 6a's `_readalong_epub_worker`, and
+    always resets the context, even if the worker raises."""
+
+    def _service(self):
+        mock_db = MagicMock()
+        service = ForgeService(
+            database_service=mock_db,
+            abs_client=MagicMock(),
+            booklore_client=MagicMock(),
+            storyteller_client=MagicMock(),
+            library_service=MagicMock(),
+            ebook_parser=MagicMock(),
+            transcriber=MagicMock(),
+            alignment_service=MagicMock(),
+        )
+        return service, mock_db
+
+    def test_binds_and_resets_user_context_around_worker_call(self):
+        service, mock_db = self._service()
+        mock_db.get_user_credentials.return_value = {"BOOKORBIT_URL": "http://bo.example"}
+        mock_db.get_user.return_value = MagicMock(id=7)
+
+        from src.utils.user_context import get_current_user_id, get_current_user_credentials
+        import src.web_server as ws
+
+        before_uid = get_current_user_id()
+        before_creds = get_current_user_credentials()
+        observed = {}
+
+        def fake_worker(abs_id, job_id=None):
+            observed['abs_id'] = abs_id
+            observed['job_id'] = job_id
+            observed['user_id'] = get_current_user_id()
+            observed['creds'] = dict(get_current_user_credentials() or {})
+
+        with patch.object(ws, "_readalong_epub_worker", side_effect=fake_worker) as mock_worker, \
+                patch("src.utils.user_config.global_fallback_allowed", return_value=True):
+            service.readalong_epub_worker = mock_worker
+            service.readalong_generation_releaser = lambda _abs_id: None
+            service._run_readalong_epub_after_forge("abs-1", 7, 99)
+
+        # The created row id is forwarded unchanged to the worker.
+        mock_worker.assert_called_once_with("abs-1", 99)
+        self.assertEqual(observed['abs_id'], "abs-1")
+        self.assertEqual(observed['job_id'], 99)
+        self.assertEqual(observed['user_id'], 7)
+        self.assertEqual(observed['creds'].get("BOOKORBIT_URL"), "http://bo.example")
+        self.assertTrue(observed['creds'].get("__allow_global_fallback__"))
+        # Ambient context must not leak past this call, regardless of what it
+        # was set to beforehand (tests run in any order).
+        self.assertEqual(get_current_user_id(), before_uid)
+        self.assertEqual(get_current_user_credentials(), before_creds)
+
+    def test_worker_exception_does_not_propagate_and_context_still_resets(self):
+        service, mock_db = self._service()
+        mock_db.get_user_credentials.return_value = {}
+        mock_db.get_user.return_value = None
+
+        import src.web_server as ws
+        from src.utils.user_context import get_current_user_id
+
+        before_uid = get_current_user_id()
+        with patch.object(ws, "_readalong_epub_worker", side_effect=RuntimeError("boom")):
+            service.readalong_epub_worker = ws._readalong_epub_worker
+            service.readalong_generation_releaser = lambda _abs_id: None
+            service._run_readalong_epub_after_forge("abs-1", 7)  # must not raise
+
+        self.assertEqual(get_current_user_id(), before_uid)
+
+    def test_wrapper_does_not_release_a_new_reservation_after_worker_handoff(self):
+        """Worker cleanup must not erase a later request's reservation."""
+        import src.web_server as ws
+
+        with ws._READALONG_GENERATION_LOCK:
+            ws._ACTIVE_READALONG_GENERATIONS.clear()
+        service, mock_db = self._service()
+        service.readalong_generation_releaser = ws._release_readalong_generation
+
+        def worker(abs_id, _job_id=None):
+            ws._release_readalong_generation(abs_id)
+            self.assertTrue(ws._claim_readalong_generation(abs_id))
+
+        service.readalong_epub_worker = worker
+        service._run_readalong_epub_after_forge("abs-1", None)
+
+        self.assertFalse(ws._claim_readalong_generation("abs-1"))
+        ws._release_readalong_generation("abs-1")
+
+    def test_no_owning_user_runs_without_binding_credentials(self):
+        """A book with no owner (user_id NULL = default/admin) runs the worker
+        without a per-user credential lookup, mirroring how the rest of the
+        codebase treats an absent user_id as the global/admin bundle."""
+        service, mock_db = self._service()
+        import src.web_server as ws
+
+        with patch.object(ws, "_readalong_epub_worker") as mock_worker:
+            service.readalong_epub_worker = mock_worker
+            service.readalong_generation_releaser = lambda _abs_id: None
+            service._run_readalong_epub_after_forge("abs-1", None)
+
+        # job_id defaults to None -- ForgeService's own best-effort save_job
+        # can fail without ever reaching this call.
+        mock_worker.assert_called_once_with("abs-1", None)
+        mock_db.get_user_credentials.assert_not_called()
 
 
 class TestForgeResume(unittest.TestCase):

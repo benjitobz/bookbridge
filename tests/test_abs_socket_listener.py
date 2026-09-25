@@ -303,8 +303,8 @@ class TestABSSocketListenerDebounce(unittest.TestCase):
         write_tracker.record_write("ABS", "slow-debounce", user_id=3)
         with write_tracker._writes_lock:
             key = "3:ABS:slow-debounce"
-            _, pct = write_tracker._recent_writes[key]
-            write_tracker._recent_writes[key] = (time.time() - 90, pct)
+            entry = write_tracker._recent_writes[key]
+            write_tracker._recent_writes[key] = (time.time() - 90, *entry[1:])
 
         book = self._make_active_book("slow-debounce", "Slow Debounce", user_id=3)
         self.mock_db.get_book.return_value = book

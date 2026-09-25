@@ -32,11 +32,11 @@ BookBridge does its own audio ↔ text alignment, using built-in Whisper transcr
 | Platform | Type | Capability |
 | :--- | :--- | :--- |
 | **Audiobookshelf** | Audiobooks + optional ebooks | Audiobook progress sync, optional ebook progress, library matching |
-| **KOReader / KOSync** | Ebooks | Reading progress sync; highlights/notes through the current Bridge Sync plugin |
+| **KOReader / KOSync** | Ebooks | Reading progress sync; highlights/notes, reading-status sync, and recently-read History sharing through the current Bridge Sync plugin |
 | **BookFusion** | Ebooks | Reading progress sync, highlight relay, and uploading local EPUBs into your BookFusion bookshelf |
 | **Storyteller** | Optional read-along reader | Progress sync, plus higher-quality alignment for books you have already built there |
 | **Grimmory** | Ebooks + audiobooks | Ebook progress, audiobook-source sync, reading sessions, optional annotation relay |
-| **BookOrbit** | Ebooks + audiobooks | Ebook progress, audiobook-source sync, reading sessions, optional highlight relay |
+| **BookOrbit** | Ebooks + audiobooks | Ebook progress, audiobook-source sync, reading sessions, optional highlight relay, read-along EPUB generation |
 | **Kavita** | Ebooks | EPUB search/download, bidirectional reading progress, collection-based auto-matching |
 | **Calibre-Web Automated (CWA)** | Ebooks + Kobo-protocol sync | Ebook source/search/download; optional progress sync through CWA's Kobo sync protocol, used by stock Kobo readers and KOReader-via-CWA |
 | **Readest** | Ebooks | Optional cloud highlight relay, optional book upload into a group |
@@ -60,7 +60,7 @@ BookBridge does its own audio ↔ text alignment, using built-in Whisper transcr
 - **Book upload to Readest** (optional, per reader) that copies matched books, or just the
   ones you are currently reading, into your Readest cloud library and files them into a group.
 - **Rich locators** using timestamps, href/fragment data, XPath, and EPUB CFI where available.
-- **Built-in audio ↔ text alignment** using Whisper transcription and EPUB SMIL timing data — no extra services required. Content-match protection catches wrong pairings, Alignment Health scores and restores maps, and Storyteller transcript assets remain a premium source when available.
+- **Built-in audio ↔ text alignment**: forced alignment matches each audiobook directly against its ebook and finds every chapter in the audio itself, running on the CPU in every image with no extra services required. Whisper transcription and EPUB SMIL timing data are the automatic fallback for books it can't follow. Content-match protection catches wrong pairings, Alignment Health scores and restores maps, and Storyteller transcript assets remain a premium source when available.
 - **Resumable jobs** for background processing and transcript work.
 
 ### Management Web UI
@@ -72,6 +72,8 @@ BookBridge does its own audio ↔ text alignment, using built-in Whisper transcr
 - **A match queue** inside Add / Update Book for reviewing and linking books in bulk.
 - **Library Suggestions** for background scanning, review, and queue building.
 - **Storyteller Editions** for building and uploading read-along books.
+- **Read-along EPUBs for BookOrbit**, built from BookBridge's own alignment with no
+  Storyteller server required, with dashboard pills showing CTC and read-along status.
 - **Watched collections** in Grimmory, BookOrbit, and Kavita that auto-match anything you drop into them.
 - **Dynamic Settings** with live connection tests and automatic restart after saving.
 - **Flexible setup** including an intentional Audiobookshelf-off mode for ebook-only or maintenance-focused use.

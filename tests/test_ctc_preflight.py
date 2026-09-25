@@ -26,6 +26,12 @@ def _fake_load(self) -> None:
     self._sample_rate = 16000
 
 
+@pytest.fixture(autouse=True)
+def _mms_ctc_model(monkeypatch):
+    """These tests exercise the MMS (torch) aligner, not the QuartzNet default."""
+    monkeypatch.setenv("CTC_MODEL", "mms_fa")
+
+
 @pytest.fixture
 def service(tmp_path):
     db = DatabaseService(str(tmp_path / "preflight.db"))

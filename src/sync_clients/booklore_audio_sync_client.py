@@ -236,6 +236,10 @@ class BookLoreAudioSyncClient(SyncClient):
             current_pct = 0.0
         if current_ts is None and duration is not None:
             current_ts = current_pct * duration
+        # No duration resolves no position at all, and leader selection subtracts these
+        # timestamps, so None must not escape the client.
+        if current_ts is None:
+            current_ts = 0.0
 
         prev_ts = prev_state.timestamp if prev_state and prev_state.timestamp is not None else 0.0
         prev_pct = prev_state.percentage if prev_state and prev_state.percentage is not None else 0.0

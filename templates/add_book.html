@@ -1139,6 +1139,11 @@
                 </div>
                 {% endif %}
 
+                <label id="readalongEpubOption" for="readalongEpubCheckbox" style="display:none; align-items:center; gap:8px; margin:10px 0; font-size:13px; color:rgba(255,255,255,0.75); cursor:pointer;">
+                    <input type="checkbox" id="readalongEpubCheckbox" name="readalong_epub_requested" value="true" disabled>
+                    Also generate a read-along EPUB for BookOrbit once this book finishes forging
+                </label>
+
                 <button type="submit" class="btn btn-success add-to-queue-btn" id="addToQueueBtn" disabled
                     data-primary-action="selection-actions"
                     data-working-label="Adding to queue..."
@@ -1223,6 +1228,9 @@
                         📖 {{ item.ebook_display_name or item.ebook_filename }}
                         {% if item.audio_source %}
                         <span class="source-badge {{ item.audio_source.lower().replace(' ', '') }}">{{ item.audio_source }}</span>
+                        {% endif %}
+                        {% if item.readalong_epub_requested %}
+                        <span class="source-badge" style="background: rgba(52, 211, 153, 0.2); color: #34d399;" title="A read-along EPUB will be generated for BookOrbit once this book finishes forging">🔊 Read-along</span>
                         {% endif %}
                     </p>
                     {% endif %}
@@ -1416,7 +1424,27 @@
         document.getElementById('selected_audio_provider_book_id').value = element.dataset.audioProviderBookId || '';
         document.getElementById('selected_audio_provider_file_id').value = element.dataset.audioProviderFileId || '';
         document.getElementById('selected_audio_cover_url').value = element.dataset.audioCoverUrl || '';
+        updateReadalongOption();
         updateAddButton();
+    }
+
+    // Phase 6b (read-along EPUB opt-in): only offered for a BookOrbit audiobook
+    // selection -- generation needs a resolvable BookOrbit audio entry to deliver
+    // into, so it can never work for ABS/Grimmory audio or an ebook-only item.
+    // Disabling (rather than just hiding) the control means an unchecked/removed
+    // box never submits with the form for an ineligible selection.
+    function updateReadalongOption() {
+        const option = document.getElementById('readalongEpubOption');
+        const checkbox = document.getElementById('readalongEpubCheckbox');
+        if (!option || !checkbox) return;
+        if (selectedAudioSource === 'BookOrbit') {
+            option.style.display = 'flex';
+            checkbox.disabled = false;
+        } else {
+            option.style.display = 'none';
+            checkbox.disabled = true;
+            checkbox.checked = false;
+        }
     }
 
     function selectEbookCard(element) {

@@ -260,7 +260,7 @@ class TestSyncCycleUserScoping(unittest.TestCase):
                     return [self.book]
                 return []
 
-            def get_latest_job(self, abs_id):
+            def get_latest_job(self, abs_id, kind=None):
                 return self.previous_job
 
             def get_book_user_ids(self, abs_id):

@@ -337,3 +337,186 @@ class TestCompletionPropagationEnabled(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestMarkKoreaderComplete(unittest.TestCase):
+    """The bridge's own completion decision is what tells the reader devices.
+
+    No service needs polling for a status field of its own: the sync cycle
+    already decides a book is finished, off whichever client led it.
+    """
+
+    def _manager(self):
+        mgr = SyncManager.__new__(SyncManager)
+        mgr.database_service = MagicMock()
+        mgr.database_service.record_koreader_status_for_book.return_value = 2
+        mgr._mark_koreader_complete = types.MethodType(
+            SyncManager._mark_koreader_complete, mgr
+        )
+        return mgr
+
+    def setUp(self):
+        self._prior = os.environ.get('KOREADER_STATUS_SYNC_ENABLED')
+        os.environ['KOREADER_STATUS_SYNC_ENABLED'] = 'true'
+
+    def tearDown(self):
+        if self._prior is None:
+            os.environ.pop('KOREADER_STATUS_SYNC_ENABLED', None)
+        else:
+            os.environ['KOREADER_STATUS_SYNC_ENABLED'] = self._prior
+
+    def test_records_complete_against_the_book(self):
+        mgr = self._manager()
+        mgr._mark_koreader_complete(_make_book(), "test-book", "Test Book", "BookOrbit")
+
+        mgr.database_service.record_koreader_status_for_book.assert_called_once()
+        args, kwargs = mgr.database_service.record_koreader_status_for_book.call_args
+        self.assertEqual(args[0], "test-book")
+        self.assertEqual(kwargs["status"], "complete")
+        self.assertEqual(kwargs["device_key"], "bridge")
+
+    def test_gate_off_records_nothing(self):
+        os.environ['KOREADER_STATUS_SYNC_ENABLED'] = 'false'
+        mgr = self._manager()
+        mgr._mark_koreader_complete(_make_book(), "test-book", "Test Book", "BookOrbit")
+        mgr.database_service.record_koreader_status_for_book.assert_not_called()
+
+    def test_gate_accepts_the_checkbox_spelling(self):
+        os.environ['KOREADER_STATUS_SYNC_ENABLED'] = 'on'
+        mgr = self._manager()
+        mgr._mark_koreader_complete(_make_book(), "test-book", "Test Book", "ABS")
+        mgr.database_service.record_koreader_status_for_book.assert_called_once()
+
+    def test_a_database_failure_never_breaks_the_cycle(self):
+        mgr = self._manager()
+        mgr.database_service.record_koreader_status_for_book.side_effect = RuntimeError("db down")
+        # Must not raise: a status write is not worth losing the sync cycle over.
+        mgr._mark_koreader_complete(_make_book(), "test-book", "Test Book", "Grimmory")
+
+    def test_is_independent_of_completion_propagation_setting(self):
+        """Telling the devices a book is finished is a different decision from
+        pushing 100% into every other service."""
+        prior = os.environ.get('SYNC_COMPLETION_PROPAGATION')
+        os.environ['SYNC_COMPLETION_PROPAGATION'] = 'false'
+        try:
+            mgr = self._manager()
+            mgr._mark_koreader_complete(_make_book(), "test-book", "Test Book", "CWA")
+            mgr.database_service.record_koreader_status_for_book.assert_called_once()
+        finally:
+            if prior is None:
+                os.environ.pop('SYNC_COMPLETION_PROPAGATION', None)
+            else:
+                os.environ['SYNC_COMPLETION_PROPAGATION'] = prior
+
+
+class TestMarkKoreaderReading(TestMarkKoreaderComplete):
+    """A part-read book with no status gets 'reading' for the devices.
+
+    The dashboard calls a book in progress on POSITION; KOReader's 'reading' is a
+    separate flag it only writes through its own UI. A book opened briefly has
+    position and no status, so it reads as in progress on the bridge and as
+    untouched on every device.
+    """
+
+    def _manager(self):
+        mgr = SyncManager.__new__(SyncManager)
+        mgr.database_service = MagicMock()
+        mgr.database_service.record_koreader_status_for_book.return_value = 1
+        mgr._mark_koreader_reading = types.MethodType(
+            SyncManager._mark_koreader_reading, mgr
+        )
+        return mgr
+
+    def test_records_reading_only_where_absent(self):
+        mgr = self._manager()
+        mgr._mark_koreader_reading(_make_book(), "test-book", "Test Book", 0.34)
+
+        args, kwargs = mgr.database_service.record_koreader_status_for_book.call_args
+        self.assertEqual(args[0], "test-book")
+        self.assertEqual(kwargs["status"], "reading")
+        self.assertEqual(kwargs["device_key"], "bridge")
+        # The headline guard: position is weaker evidence than a reader's own
+        # decision, so this must never overrule an existing status.
+        self.assertTrue(kwargs["only_if_absent"])
+
+    def test_gate_off_records_nothing(self):
+        os.environ['KOREADER_STATUS_SYNC_ENABLED'] = 'false'
+        mgr = self._manager()
+        mgr._mark_koreader_reading(_make_book(), "test-book", "Test Book", 0.34)
+        mgr.database_service.record_koreader_status_for_book.assert_not_called()
+
+    def test_a_database_failure_never_breaks_the_cycle(self):
+        mgr = self._manager()
+        mgr.database_service.record_koreader_status_for_book.side_effect = RuntimeError("db down")
+        mgr._mark_koreader_reading(_make_book(), "test-book", "Test Book", 0.34)
+
+
+class TestReadingFloor(unittest.TestCase):
+    """Position only counts as 'reading' above the 1% floor the tracker posts
+    already use -- otherwise opening a book for ten seconds marks it reading on
+    every device."""
+
+    def test_floor_matches_the_tracker_convention(self):
+        from src.sync_manager import _KOREADER_READING_MIN_PCT
+        self.assertEqual(_KOREADER_READING_MIN_PCT, 0.01)
+
+    def test_floor_admits_a_barely_started_real_read(self):
+        """Measured against the live library: the book this feature was built
+        for sits at 1.05%, just above the floor. A floor of 0.02 would drop it."""
+        from src.sync_manager import _KOREADER_READING_MIN_PCT
+        self.assertLess(_KOREADER_READING_MIN_PCT, 0.010476)
+
+    def test_floor_excludes_an_accidental_open(self):
+        from src.sync_manager import _KOREADER_READING_MIN_PCT
+        self.assertGreater(_KOREADER_READING_MIN_PCT, 0.0003)
+
+
+class TestReadingGapFillOnSettledBooks(unittest.TestCase):
+    """A part-read book that is not being read right now still needs its status.
+
+    Settled is the NORMAL condition for a book you are part way through, so
+    gating the gap-fill on movement would mean it only ever got a status the
+    next time you happened to open it.
+    """
+
+    def _manager(self, threshold=0.99):
+        mgr = SyncManager.__new__(SyncManager)
+        mgr.database_service = MagicMock()
+        mgr.database_service.record_koreader_status_for_book.return_value = 1
+        mgr._completion_threshold = lambda: threshold
+        mgr._mark_koreader_reading = MagicMock()
+        mgr._maybe_mark_koreader_reading_from_config = types.MethodType(
+            SyncManager._maybe_mark_koreader_reading_from_config, mgr)
+        return mgr
+
+    def _config(self, *pcts):
+        return {
+            f"c{i}": types.SimpleNamespace(current={"pct": p})
+            for i, p in enumerate(pcts)
+        }
+
+    def test_uses_the_furthest_client_position(self):
+        mgr = self._manager()
+        mgr._maybe_mark_koreader_reading_from_config(
+            _make_book(), self._config(0.02, 0.34, 0.10), "b", "Book")
+        mgr._mark_koreader_reading.assert_called_once()
+        self.assertAlmostEqual(mgr._mark_koreader_reading.call_args[0][3], 0.34)
+
+    def test_below_the_floor_does_nothing(self):
+        mgr = self._manager()
+        mgr._maybe_mark_koreader_reading_from_config(
+            _make_book(), self._config(0.0003), "b", "Book")
+        mgr._mark_koreader_reading.assert_not_called()
+
+    def test_a_finished_book_does_nothing(self):
+        mgr = self._manager()
+        mgr._maybe_mark_koreader_reading_from_config(
+            _make_book(), self._config(1.0), "b", "Book")
+        mgr._mark_koreader_reading.assert_not_called()
+
+    def test_no_positions_at_all_does_nothing(self):
+        mgr = self._manager()
+        mgr._maybe_mark_koreader_reading_from_config(_make_book(), {}, "b", "Book")
+        mgr._mark_koreader_reading.assert_not_called()
+        mgr._maybe_mark_koreader_reading_from_config(
+            _make_book(), self._config(None), "b", "Book")
+        mgr._mark_koreader_reading.assert_not_called()
