@@ -6,6 +6,7 @@ from 0.7s to 16.7s, 4.4 minutes for 30 chunks. Input seeking is sample-exact on
 PCM WAV, so the chunks must stay identical -- Whisper's timestamps are offset by
 each chunk's start, and a shifted chunk would shift every transcript segment.
 """
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -35,6 +36,10 @@ def _frames(path: Path) -> bytes:
         return wav.readframes(wav.getnframes())
 
 
+@unittest.skipUnless(
+    shutil.which("ffmpeg") and shutil.which("ffprobe"),
+    "ffmpeg/ffprobe not on PATH -- these split real audio",
+)
 class TestSplitAudioFile(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()

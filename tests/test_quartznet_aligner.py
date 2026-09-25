@@ -5,6 +5,7 @@ wrapping, which was verified live against Storyteller's own cached QuartzNet
 emissions (99.97% argmax agreement, identical frame counts).
 """
 import hashlib
+import shutil
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -396,6 +397,7 @@ def _sine(tmp_path, name, seconds, frequency):
     return path
 
 
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg not on PATH -- decodes real audio")
 def test_audio_streams_window_by_window_with_no_temp_file(tmp_path):
     """Two parts decode to exactly the samples the whole-book temp-file decode gives,
     in 38 s windows across the part boundary, and no temp file is written."""
