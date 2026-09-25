@@ -77,12 +77,13 @@ substantially lower memory use and safer book replacement on KOReader devices.
 - **Fixed-page comics keep the right page between KOReader and Grimmory (#436).** CBZ
   progress travels as a real page number instead of a pretend EPUB locator, including
   archives with WebP pages. Adjacent turns are preserved even just after BookBridge
-  writes, and a failed Grimmory write cannot hide newer reader progress.
+  writes, and a failed Grimmory write cannot hide newer reader progress. Contributed
+  by [@grandson965](https://github.com/grandson965).
 
 - **Grimmory covers and progress stay tied to the selected book (#435, #437).** Ebook
   covers use the correct media endpoint. Reads, writes, and cached files retain the
   chosen ID after a rename; ambiguous legacy mappings stop rather than guessing a
-  different book.
+  different book. Contributed by [@grandson965](https://github.com/grandson965).
 
 - **A rounded position no longer pulls a reader backward (#434).** A newer bridge
   write cannot beat an older, further-ahead device position merely because its

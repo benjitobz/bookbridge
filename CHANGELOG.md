@@ -28,20 +28,18 @@ All notable changes to BookBridge will be documented in this file.
   aligns each audiobook directly against its ebook's text word by word, or leave it
   off to always use transcription. It used to be an experimental option that needed
   the multi-gigabyte `-ctc` image and, in practice, an NVIDIA GPU. The new model,
-  QuartzNet (the one Storyteller uses), runs on the CPU through a component every
-  image already includes, and it finds each chapter in the audio itself, so long
-  books no longer wait for a Whisper transcript: a 22-hour audiobook aligns in about
-  7 minutes, a 39-hour one in about 15. Tested against 15 existing books, it matched
-  the previous alignment on 11 (98-99% of words within half a second), fixed one
-  whose old alignment was up to 2 hours off, and sent the two it could not follow to
-  transcription on its own: one narrated out of chapter order, one whose audiobook
-  retells the text instead of reading it. QuartzNet only understands English, so
-  books in other languages use transcription automatically. The model is downloaded
-  once on first use (77 MB); if that download fails, point **QuartzNet model file**
-  (under **Advanced — forced alignment model**) at a copy you already have, such as
-  your Storyteller install's. It is on by default for new installs; existing installs
-  keep their current choice. The older **MMS** model stays available under **CTC
-  Model** for books that are not in English, and still needs the `-ctc` image.
+  QuartzNet, runs on the CPU through a component every image already includes, and
+  it finds each chapter in the audio itself, so long books no longer wait for a
+  Whisper transcript: a 22-hour audiobook aligns in about 7 minutes, a 39-hour one
+  in about 15. Tested against 15 existing books, it matched the previous alignment
+  on 11 (98-99% of words within half a second), fixed one whose old alignment was up
+  to 2 hours off, and sent the two it could not follow to transcription on its own:
+  one narrated out of chapter order, one whose audiobook retells the text instead of
+  reading it. QuartzNet only understands English, so books in other languages use
+  transcription automatically. The model is downloaded once on first use (77 MB);
+  if that download fails, point **QuartzNet model file** (under **Advanced — forced
+  alignment model**) at a copy you already have. It is on by default for new
+  installs; existing installs keep their current choice.
 
 - **Recently-read books can now be shared between your devices.** KOReader writes its
   History only when you open a book *on that device*, so a book you read on the Kobo
@@ -114,6 +112,15 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- **A missing CWA ebook is no longer re-downloaded as the wrong book (#448).**
+  When a cached CWA ebook had to be fetched again, BookBridge searched CWA for the
+  book's ID number as text and accepted the only result, even when that result was a
+  different book whose title happened to contain those digits (an ISBN, for
+  example). Several audiobooks could end up aligned against one unrelated ebook. It
+  now only accepts the book with that exact ID, and otherwise fetches it directly by
+  ID. If you were affected, delete the duplicate `cwa_*.epub` files in
+  `/data/epub_cache` (they share an identical checksum) and re-align those books.
+
 - **Reading on in Storyteller after listening no longer snaps you back to the
   audiobook position (#447).** When you switched from listening in
   Audiobookshelf to reading in Storyteller, each sync mistook your first few
@@ -137,7 +144,8 @@ All notable changes to BookBridge will be documented in this file.
   separate words with an extra space injected mid-word (`<b>Th</b>e` became
   "Th e" instead of "The"), which could break audiobook alignment and position
   syncing for affected books. Word boundaries are now preserved without changing
-  anything for ordinary books.
+  anything for ordinary books. Contributed by
+  [@mehalter](https://github.com/mehalter) in #445.
 
 - **Synced ebook positions land in the right place.** When progress from an
   audiobook was sent to an ebook reader, the position could land in the previous
@@ -331,6 +339,7 @@ This release runs database migrations automatically and ships BridgeSync **0.6.1
   Completion now travels through Audiobookshelf's playback-session event path, so
   official and third-party clients that subscribe to session updates refresh without
   waiting for a poll. A completion propagated from reading adds no listening time.
+  Contributed by [@Kyomorie](https://github.com/Kyomorie) in #433.
 
 - **Calibre-Web Automated progress stays attached to the book you selected (#427).**
   BookBridge now stores the numeric ID from CWA's download link, resolves older
@@ -341,7 +350,8 @@ This release runs database migrations automatically and ships BridgeSync **0.6.1
 - **KoSync timestamps mean UTC regardless of the container timezone (#438).**
   Older timezone-naive timestamps were interpreted as local time on non-UTC hosts,
   skewing freshness checks and the timestamp returned to readers. They are now
-  converted explicitly as UTC.
+  converted explicitly as UTC. Contributed by
+  [@grandson965](https://github.com/grandson965) in #438.
 
 - **Actively read series appear under In Progress (#432).** With Group series on,
   a series containing any partially read volume now appears under In Progress.
@@ -350,10 +360,12 @@ This release runs database migrations automatically and ships BridgeSync **0.6.1
   control also stays beside its series heading. (#430)
 
 - **Show Grimmory ebook covers through its book media endpoint (#435).** Ebook
-  covers use the book ID rather than the audiobook file-cover route.
+  covers use the book ID rather than the audiobook file-cover route. Contributed by
+  [@grandson965](https://github.com/grandson965) in #435.
 - **Keep Grimmory reads, writes, and cached books tied to the selected ID (#437).**
   Ambiguous or refused legacy mappings stop without guessing another book. Renames
   preserve the original cache filename, including older mappings where it was unset.
+  Contributed by [@grandson965](https://github.com/grandson965) in #437.
 - **Keep a reader's position when a sync only rounds it backward (#434).** A newer
   bridge write no longer overrides an older, further-ahead device position merely
   because it is newer. Only a corroborated rewind can retire positions reported
@@ -366,7 +378,7 @@ This release runs database migrations automatically and ships BridgeSync **0.6.1
   never invent page 1 for non-zero progress, and preserve adjacent page turns even
   just after a bridge write. Unconfirmed Grimmory writes no longer hide concurrent
   reader progress. Unsupported comic archives and Kavita retain their existing
-  behavior. (#436)
+  behavior. Contributed by [@grandson965](https://github.com/grandson965) in #436.
 
 - **Prepare KOReader's download list when books are matched.** After a bridge
   restart, catalog changes now start the manifest worker for installs that have
