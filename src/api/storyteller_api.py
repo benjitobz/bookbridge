@@ -306,9 +306,18 @@ class StorytellerAPIClient:
             if pct is None:
                 pct = 0.0
 
+            # "timestamp" is caller-supplied and stored verbatim (see
+            # update_position/_build_position_payload), so it identifies who wrote
+            # the current position (#447). "updatedAt" is server-generated and never
+            # equals a timestamp we sent, so it must not serve as that marker.
+            position_ts = self._coerce_timestamp(data.get('timestamp'))
+            if not position_ts:
+                position_ts = None
+
             return {
                 "pct": pct,
                 "ts": self._coerce_timestamp(data.get('timestamp') or data.get("updatedAt")),
+                "position_ts": position_ts,
                 "href": locator.get('href'),
                 "type": locator.get("type"),
                 "frag": fragments[0] if fragments else None,
@@ -465,6 +474,7 @@ class StorytellerAPIClient:
         percentage: float,
         rich_locator: Optional[LocatorResult],
         previous_payload: Optional[dict] = None,
+        timestamp: Optional[int] = None,
     ) -> dict:
         locator = {
             "href": "",
@@ -497,7 +507,7 @@ class StorytellerAPIClient:
                 locator["locations"]["partialCfi"] = rich_locator.cfi
 
         return {
-            "timestamp": int(time.time() * 1000),
+            "timestamp": int(timestamp) if timestamp is not None else int(time.time() * 1000),
             "locator": locator,
         }
 
@@ -536,7 +546,13 @@ class StorytellerAPIClient:
                 sanitize_log_data(changes),
             )
 
-    def update_position(self, book_uuid: str, percentage: float, rich_locator: LocatorResult = None) -> bool:
+    def update_position(
+        self,
+        book_uuid: str,
+        percentage: float,
+        rich_locator: LocatorResult = None,
+        timestamp: Optional[int] = None,
+    ) -> bool:
         previous_payload = None
         if not rich_locator or logger.isEnabledFor(logging.DEBUG):
             previous_payload = self.get_position_details_payload(book_uuid)
@@ -555,6 +571,7 @@ class StorytellerAPIClient:
             percentage=percentage,
             rich_locator=rich_locator,
             previous_payload=previous_payload,
+            timestamp=timestamp,
         )
 
         if exact_position is not None:

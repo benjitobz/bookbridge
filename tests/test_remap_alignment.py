@@ -115,7 +115,25 @@ def test_reset_menu_renders_complete_click_handlers():
     assert [button.get("onclick") for button in buttons] == [
         'clearPosition("bookorbit:5204")',
         'remapAlignment("bookorbit:5204", this)',
+        'generateReadalongEpub("bookorbit:5204", this)',
     ]
+    # No readalong_eligible/readalong_audio_ok keys on this bare fixture mapping
+    # -> Jinja Undefined is falsy, so the read-along button renders its
+    # ineligibility as a hover title but stays CLICKABLE, and the "Remove"
+    # button is omitted entirely rather than rendered against unknown
+    # eligibility.
+    #
+    # This assertion is inverted from its original form, which required
+    # `disabled` on the reasoning that a disabled button is "never a silent
+    # no-op on click". That is backwards: a disabled <button> swallows the
+    # click entirely -- no request, no error, no visual change -- and the
+    # render-time eligibility snapshot goes stale as soon as a book finishes
+    # aligning. That combination is what made "Create read-along" do nothing
+    # at all on a freshly matched book. The route re-checks eligibility on
+    # every POST and returns a reason the button's JS renders, so letting the
+    # click through is strictly more informative than blocking it.
+    readalong_btn = buttons[2]
+    assert readalong_btn.get("disabled") is None
 
 
 class MockContainer:

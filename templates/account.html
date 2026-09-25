@@ -93,8 +93,11 @@
                 onclick="this.select()">
             <button type="button" class="btn-link" onclick="copyPublicUrl(this)">Copy</button>
         </div>
-        <p class="help">Suggested from this browser's address — adjust the host or port to match how
-            your devices reach the server (KoSync port: {{ get_val('KOSYNC_PORT', '5757') }}).</p>
+        {% set kosync_split_port = get_val('KOSYNC_PORT', '')|trim %}
+        <p class="help">Suggested from this browser's address — adjust the host to one your devices
+            can reach. Enter the base address only, with no <code>/api</code> or <code>/koreader</code>
+            suffix.{% if kosync_split_port and kosync_split_port != '5757' %} Split-port mode is on, so
+            KOSync listens on port {{ kosync_split_port }} — publish that port in Docker too.{% endif %}</p>
         <p class="help warning" id="kosync_url_warning" hidden>
             This address uses localhost/loopback, which points back to the KOReader device itself.
             Replace the host above with this server's LAN hostname or IP address before copying it.
@@ -137,8 +140,9 @@
     (function () {
         var urlInput = document.getElementById('kosync_public_url');
         if (!urlInput) return;
-        var syncPort = {{ get_val('KOSYNC_PORT', '5757')|tojson }};
-        urlInput.value = location.protocol === 'https:'
+        var syncPort = {{ get_val('KOSYNC_PORT', '')|trim|tojson }};
+        var splitPort = syncPort !== '' && syncPort !== '5757';
+        urlInput.value = (location.protocol === 'https:' || !splitPort)
             ? location.origin
             : location.protocol + '//' + location.hostname + ':' + syncPort;
         urlInput.addEventListener('input', updatePublicUrlWarning);

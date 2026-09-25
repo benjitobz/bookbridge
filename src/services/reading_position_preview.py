@@ -14,7 +14,9 @@ import re
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
+
+from src.utils.ebook_dom_map import content_string_nodes, joined_text, runs_from_nodes, strip_inline_joiner
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +172,21 @@ def _normalized_text(value: object) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
+def _canonical_text(node: BeautifulSoup | Tag) -> str:
+    """Reproduce ``EbookParser.extract_text_and_map``'s exact text-extraction
+    algorithm for an already-parsed BeautifulSoup document or ``Tag``
+    subtree, so it can be compared 1:1 against a slice of ``full_text`` --
+    including at an inline (e.g. bionic-reading) word join, which a plain
+    ``get_text(separator=' ')`` would not reproduce: it always inserts a
+    literal space at every text-node boundary, so ``full_text[start:end]``
+    (which may contain ``INLINE_TEXT_JOINER`` instead) would never equal it
+    for a spine item with any inline join, silently skipping that spine's
+    heading detection below.
+    """
+    nodes = content_string_nodes(node)
+    return joined_text(nodes, runs_from_nodes(nodes))
+
+
 def _heading_groups(
     full_text: str,
     spine_map: Optional[Iterable[dict]],
@@ -213,13 +230,13 @@ def _heading_groups(
             logger.debug("Reading position preview: unparsable spine markup skipped: %s", e)
             continue
 
-        spine_text = _normalized_text(soup.get_text(separator=" ", strip=True))
+        spine_text = _normalized_text(_canonical_text(soup))
         if not spine_text or full_text[start:end] != spine_text:
             continue
 
         spans: list[tuple[int, int]] = []
         for heading in soup.find_all(re.compile(r"^h[1-6]$", re.IGNORECASE)):
-            heading_text = _normalized_text(heading.get_text(separator=" ", strip=True))
+            heading_text = _normalized_text(_canonical_text(heading))
             if not heading_text:
                 continue
 
@@ -310,7 +327,9 @@ def _bounded_excerpt(
     # Only the OUTER edges are trimmed: stripping the marker-facing edges deletes
     # the space the position sits on, so a boundary renders as
     # "several|notches" and reads as though the marker landed mid-word.
-    return before.lstrip(), after.rstrip()
+    # strip_inline_joiner runs last so it never disturbs the heading-newline
+    # positions _format_excerpt_segment just computed against the raw slice.
+    return strip_inline_joiner(before.lstrip()), strip_inline_joiner(after.rstrip())
 
 
 def unavailable_preview(message: str, *, source: str = "BookBridge", percentage=None) -> dict:

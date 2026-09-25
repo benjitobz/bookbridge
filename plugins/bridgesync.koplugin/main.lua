@@ -22,6 +22,8 @@ local BridgeAnnotations = require("bridge_annotations")
 local BridgeSweep = require("bridge_sweep")
 local BridgeSyncCoordinator = require("bridge_sync_coordinator")
 local BridgeStatsBatches = require("bridge_stats_batches")
+local BridgeBookStatus = require("bridge_book_status")
+local BridgeReadHistory = require("bridge_read_history")
 local BridgeVersion = require("bridge_version")
 local ManifestRules = require("bridge_manifest_rules")
 local BridgeSqliteState = require("bridge_sqlite_state")
@@ -1272,14 +1274,20 @@ function BridgeSync:_scheduleAutoStatsSync(reason, delay_seconds, silent, retrie
 end
 
 function BridgeSync:_maybeAutoSyncStats(reason)
-    if not self.is_enabled or not self.session_tracking_enabled or not self.auto_sync_stats then
+    -- Every skip says why. "It didn't sync on wake" is otherwise undiagnosable:
+    -- four different conditions bail out here, all of them silently, and the
+    -- only visible evidence is an absence of log lines.
+    local function skip(why)
+        self:logInfo("Auto stats sync skipped (" .. tostring(reason) .. "):", why)
         return false
     end
-    if not NetworkMgr:isConnected() then
-        return false
-    end
-    if (os.time() - (self.last_stats_sync_time or 0)) < 300 then
-        return false
+    if not self.is_enabled then return skip("Bridge Sync is disabled") end
+    if not self.session_tracking_enabled then return skip("session tracking is off") end
+    if not self.auto_sync_stats then return skip("auto stats sync is off") end
+    if not NetworkMgr:isConnected() then return skip("no network") end
+    local since = os.time() - (self.last_stats_sync_time or 0)
+    if since < 300 then
+        return skip(string.format("cooldown, last sync %ds ago (need 300)", since))
     end
     return self:_scheduleAutoStatsSync(reason, 1, true)
 end
@@ -1449,7 +1457,13 @@ function BridgeSync:onResume()
         self.needs_wake_sync = true
     end
     if self:_hasWakeWork() then
+        self:logInfo("Wake: scheduling sync in", self.wake_sync_delay_seconds, "s")
         self:_scheduleSync(self.wake_sync_delay_seconds, true)
+    else
+        -- The counterpart to the skip reasons in _maybeAutoSyncStats: without
+        -- this, a wake that decides there is nothing to do is indistinguishable
+        -- from a wake that never reached the plugin at all.
+        self:logInfo("Wake: nothing to sync (no pending work and everything within cooldown)")
     end
     return false
 end
@@ -2789,7 +2803,91 @@ function BridgeSync:_mergeForeignStatistics(payload, stats_state)
     end
 
     result.watermark = tonumber(response.watermark)
+
+    -- The PARENT does the reading-history merge (ReadHistory is a live
+    -- singleton it still holds; a child's write to history.lua is overwritten
+    -- when the parent next flushes). It sources the reads from the statistics
+    -- DB itself, so only the go-ahead needs to cross the fork.
+    result.merge_history = response.merge_history and true or false
+
     return result
+end
+
+-- Tell the rest of KOReader that book metadata changed underneath it.
+--
+-- We write sidecars and reading history behind the UI's back, so anything
+-- holding a cached view of either keeps showing the old picture until it is
+-- restarted. `BookMetadataChanged` is KOReader's own broadcast for exactly this
+-- (see filemanagerbookinfo.lua) -- the file browser, and third-party shelf
+-- plugins that listen for it, drop their caches and redraw. Best effort: an
+-- listener that raises must not cost the sync its result.
+--
+-- PARENT process only. UIManager belongs to the parent, and a forked child
+-- broadcasting into its own copy of the event loop reaches nothing.
+function BridgeSync:_announceLibraryChanged()
+    local ok, err = pcall(function()
+        local Event = require("ui/event")
+        UIManager:broadcastEvent(Event:new("BookMetadataChanged"))
+    end)
+    if ok then
+        -- Logged because "did the refresh actually fire?" is otherwise
+        -- unanswerable from the outside: the effect is a cache drop inside
+        -- other plugins, which leaves no trace of its own.
+        self:logInfo("Announced BookMetadataChanged so open views refresh")
+    else
+        self:logWarn("Could not announce library change:", tostring(err or "unknown error"))
+    end
+end
+
+-- Every book this device has reading events for, and when it was last read.
+--
+-- Deliberately read from the LOCAL statistics database rather than from the
+-- events that arrived in this sync. The merge delta only carries what is newer
+-- than the watermark, so a book merged days ago is never re-sent and a
+-- delta-driven history merge could never see the existing backlog -- it would
+-- only ever file a book that happened to be read between two syncs. The stats
+-- DB is the accumulated truth and already holds every merged foreign read.
+-- @treturn table md5 -> newest read timestamp
+function BridgeSync:_collectLocalReadTimestamps(max_age_days)
+    local out = {}
+    if not SQ3 then return out end
+    local db_path = self:_findStatisticsDbPath()
+    if not db_path then return out end
+
+    local cutoff = os.time() - ((max_age_days or BridgeReadHistory.MAX_AGE_DAYS) * 86400)
+    local conn = SQ3.open(db_path)
+    if not conn then return out end
+
+    pcall(function()
+        conn:exec("PRAGMA busy_timeout = 5000")
+        local sql = string.format([[
+            SELECT b.md5, MAX(p.start_time)
+            FROM book b JOIN page_stat_data p ON p.id_book = b.id
+            WHERE b.md5 IS NOT NULL AND b.md5 != ''
+            GROUP BY b.id
+            HAVING MAX(p.start_time) >= %d
+        ]], cutoff)
+        local rows, count = conn:exec(sql)
+        if rows and count then
+            for i = 1, count do
+                local md5 = tostring(rows[1][i] or "")
+                local ts = tonumber(rows[2][i])
+                if md5 ~= "" and ts then out[md5] = ts end
+            end
+        end
+    end)
+    pcall(function() conn:close() end)
+    return out
+end
+
+function BridgeSync:_mergeForeignReadHistory()
+    local ok_hist, ReadHistory = pcall(require, "readhistory")
+    if not ok_hist or not ReadHistory then
+        self:logWarn("Reading-history merge skipped: readhistory unavailable")
+        return { added = 0, skipped = 0, too_old = 0, capped = 0 }
+    end
+    local reads = self:_collectLocalReadTimestamps()
+    return BridgeReadHistory.merge(ReadHistory, self:_buildHashIndex(), reads)
 end
 
 function BridgeSync:_runStatisticsSync(stats_state)
@@ -2855,7 +2953,93 @@ function BridgeSync:_runStatisticsSync(stats_state)
     elseif result.merged_page_stats > 0 then
         self:logInfo("Merged", result.merged_page_stats, "reading stat rows from other devices")
     end
+    result.merge_history = merge.merge_history
 
+    -- Reading status rides the same cadence as stats but is a separate exchange:
+    -- it comes from the sidecars, not statistics.sqlite, and a failure on either
+    -- side must not cost the other its results.
+    local status_result = self:_runBookStatusSync()
+    result.status_uploaded = status_result.uploaded or 0
+    result.status_applied = status_result.applied or 0
+    result.status_deferred = status_result.deferred or 0
+    result.status_error = status_result.err
+    if status_result.err then
+        self:logWarn("Reading status sync failed:", status_result.err)
+    elseif status_result.disabled then
+        self:logInfo("Reading status sync is disabled on the bridge")
+    else
+        self:logInfo(
+            "Reading status sync: uploaded", status_result.uploaded or 0,
+            "applied", status_result.applied or 0,
+            "unchanged", status_result.unchanged or 0,
+            "deferred", status_result.deferred or 0,
+            "errors", status_result.errors or 0
+        )
+    end
+
+    return result
+end
+
+-- Exchange this device's sidecar reading statuses with the bridge.
+--
+-- Every book the bridge knows comes back, not just ones this device reported:
+-- the point of the feature is a book delivered here but never opened, which by
+-- definition has nothing to report and still needs its status.
+function BridgeSync:_runBookStatusSync()
+    local result = {
+        uploaded = 0, applied = 0, unchanged = 0,
+        deferred = 0, errors = 0, err = nil, disabled = false,
+    }
+
+    local ok_run, run_err = pcall(function()
+        local device, device_id = self:_currentDeviceIdentity()
+        local hash_index = self:_buildHashIndex()
+        -- `dir` lets collect() also read sidecars whose book file is gone. Mirror
+        -- deletion removes the ebook and leaves the .sdr, and on a real device
+        -- those are most of the statused sidecars -- their status is still worth
+        -- sharing, because the book may well be present on another device.
+        local books = BridgeBookStatus.collect(hash_index, { dir = self.download_dir })
+
+        local ok, response = self.api:uploadBookStatus({
+            device = device,
+            device_id = device_id,
+            books = books,
+        })
+        if not ok then
+            result.err = tostring(response or "status upload failed")
+            return
+        end
+        if type(response) == "table" and response.enabled == false then
+            result.disabled = true
+            return
+        end
+        result.uploaded = tonumber(response and response.accepted) or #books
+
+        local ok_merged, merged = self.api:getMergedBookStatus()
+        if not ok_merged then
+            result.err = tostring(merged or "merged status fetch failed")
+            return
+        end
+        if type(merged) == "table" and merged.enabled == false then
+            result.disabled = true
+            return
+        end
+
+        local totals = BridgeBookStatus.apply(hash_index, merged and merged.books or {}, {
+            -- The open document's DocSettings live in memory and are rewritten
+            -- wholesale on close, so a write here would be discarded. The
+            -- existing after-close sync picks it up on the next pass.
+            skip_path = self:_currentDocumentPath(),
+        })
+        result.applied = totals.applied
+        result.unchanged = totals.unchanged
+        result.deferred = totals.deferred
+        result.errors = totals.errors
+    end)
+
+    if not ok_run and not result.err then
+        result.err = tostring(run_err or "reading status sync failed")
+    end
     return result
 end
 
@@ -2930,6 +3114,32 @@ function BridgeSync:syncReadingStats(silent)
             self:_showMessage(T(_("Reading stats sync failed: %1"), tostring(result or "Unknown error")), 5)
         end
         return false
+    end
+
+    -- Reading history is written HERE, in the parent: ReadHistory is a live
+    -- singleton and the forked child's write to history.lua is clobbered the
+    -- next time the parent flushes its own in-memory copy.
+    local library_changed = (result.status_applied or 0) > 0
+
+    if result.merge_history then
+        local hist = self:_mergeForeignReadHistory()
+        if (hist.added or 0) > 0 or (hist.capped or 0) > 0 or (hist.deduped or 0) > 0 then
+            self:logInfo(
+                "Reading history merge: added", hist.added or 0,
+                "unchanged", hist.unchanged or 0,
+                "skipped", hist.skipped or 0,
+                "too old", hist.too_old or 0,
+                "deferred by cap", hist.capped or 0,
+                "deduped", hist.deduped or 0
+            )
+        end
+        if (hist.added or 0) > 0 or (hist.deduped or 0) > 0 then
+            library_changed = true
+        end
+    end
+
+    if library_changed then
+        self:_announceLibraryChanged()
     end
 
     if result.device_key and result.device_key ~= "" then

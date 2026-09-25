@@ -350,7 +350,11 @@ class ShelfWatchService:
 
         for book in books:
             stats['scanned'] += 1
-            grimmory_id = str(book.get('id', '')).strip()
+            # A shelf entry can carry an explicit "id": null, and .get's default only
+            # fires on a missing key, so str() would turn it into the literal "None" —
+            # a truthy id that reaches the source download as if it were real.
+            raw_grimmory_id = book.get('id')
+            grimmory_id = '' if raw_grimmory_id is None else str(raw_grimmory_id).strip()
             filename = self._extract_filename(book)
             if not grimmory_id or not filename:
                 logger.debug(f"Shelf-watch: skipping book with missing id/filename: {book.get('title')}")

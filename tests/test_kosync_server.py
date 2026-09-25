@@ -2580,11 +2580,56 @@ class TestKosyncAuthStubs(unittest.TestCase):
 
     def test_create_does_not_leak_configured_username(self):
         resp = self.client.post('/users/create', json={'username': 'someoneelse'})
+        self.assertEqual(resp.status_code, 401)
+        self.assertNotIn('testuser', str(resp.get_json() or {}))
+        self.assertNotIn('testpass', str(resp.get_json() or {}))
+
+    def test_create_echoes_requested_username_for_configured_account(self):
+        import hashlib
+        resp = self.client.post('/users/create', json={
+            'username': 'TestUser', 'password': hashlib.md5(b'testpass').hexdigest(),
+        })
         self.assertEqual(resp.status_code, 201)
-        data = resp.get_json() or {}
         # echoes the requested name, never the server's configured KOSYNC_USER
-        self.assertEqual(data.get('username'), 'someoneelse')
-        self.assertNotIn('testuser', str(data))
+        self.assertEqual((resp.get_json() or {}).get('username'), 'TestUser')
+
+    def test_create_then_auth_issue_446(self):
+        """#446: POST /users/create answered 201 for any username, then the
+        client's immediate GET /users/auth with the same md5 key 401'd
+        ("Failed auth attempt for user 'witchertest'") for every account.
+        Registration must only succeed when the same credentials authenticate."""
+        import hashlib
+        koreader = 'application/vnd.koreader.v1+json'
+        cases = [
+            ('witchertest', hashlib.md5(b'witcher-pass').hexdigest(), 401),
+            ('testuser', hashlib.md5(b'wrong-pass').hexdigest(), 401),
+            ('testuser', hashlib.md5(b'testpass').hexdigest(), 201),
+        ]
+        for username, key, expected_create in cases:
+            with self.subTest(username=username, key=key):
+                create = self.client.post(
+                    '/users/create',
+                    json={'username': username, 'password': key},
+                    headers={'Accept': koreader},
+                )
+                auth = self.client.get('/users/auth', headers={
+                    'Accept': koreader, 'x-auth-user': username, 'x-auth-key': key,
+                })
+                self.assertEqual(create.status_code, expected_create)
+                self.assertEqual(create.status_code == 201, auth.status_code == 200)
+
+    def test_create_refusal_logs_and_explains(self):
+        import hashlib
+        with self.assertLogs('src.api.kosync_server', level='WARNING') as logs:
+            resp = self.client.post('/users/create', json={
+                'username': 'witchertest', 'password': hashlib.md5(b'witcher-pass').hexdigest(),
+            })
+        self.assertEqual(resp.status_code, 401)
+        self.assertIn('Settings', (resp.get_json() or {}).get('message', ''))
+        self.assertTrue(any(
+            "KOSync Create: Registration refused for unconfigured user 'witchertest'" in line
+            for line in logs.output
+        ))
 
 
 class TestKosyncEstimatedSessions(unittest.TestCase):

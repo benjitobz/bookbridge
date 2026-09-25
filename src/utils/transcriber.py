@@ -477,10 +477,14 @@ class AudioTranscriber:
             # Output as WAV for consistency
             new_filename = f"{base_name}_split_{i+1:03d}.wav"
             new_path = file_path.parent / new_filename
+            # -ss BEFORE -i seeks the input. After -i, ffmpeg decoded the whole
+            # file up to start_time for every chunk: per-chunk time grew from
+            # 0.7s to 16.7s on a 22h book (4.4 min for 30 chunks). Seeking a PCM
+            # WAV is sample-exact, so the chunks are identical either way.
             cmd = [
                 'ffmpeg', '-y',
-                '-i', str(file_path),
                 '-ss', str(start_time),
+                '-i', str(file_path),
                 '-t', str(segment_duration),
                 '-ar', '16000',      # 16kHz
                 '-ac', '1',          # Mono

@@ -49,6 +49,7 @@ COPY static/ /app/static/
 COPY alembic/ /app/alembic/
 COPY alembic.ini /app/alembic.ini
 COPY plugins/ /app/plugins/
+COPY RELEASE_NOTES.md /app/RELEASE_NOTES.md
 COPY scripts/backup_db.sh /app/scripts/backup_db.sh
 
 COPY start.sh /app/start.sh

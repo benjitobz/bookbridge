@@ -248,7 +248,7 @@ class TestMultiUserAuth(unittest.TestCase):
         self.assertEqual(self.client.get('/api/kosync-plugin/version').status_code, 200)
         self.assertEqual(self.client.get('/api/kosync-plugin/download').status_code, 200)
 
-    def test_account_suggests_browser_visible_kosync_url(self):
+    def test_account_suggests_split_port_kosync_url(self):
         self.svc.create_user("reg", "pw", role="user")
         self.client.post('/login', data={'username': 'reg', 'password': 'pw'})
 
@@ -259,6 +259,37 @@ class TestMultiUserAuth(unittest.TestCase):
         self.assertIn("? location.origin", page)
         self.assertIn("location.protocol + '//' + location.hostname + ':' + syncPort", page)
         self.assertIn('var syncPort = "5758"', page)
+        self.assertIn("var splitPort = syncPort !== '' && syncPort !== '5757'", page)
+        self.assertIn('KOSync listens on port 5758', page)
+
+    def test_account_keeps_browser_port_when_split_port_mode_is_off(self):
+        """Default install publishes 8080:5757, so the browser's own origin is the
+        only address that reaches KOSync — never a hardcoded :5757."""
+        self.svc.create_user("reg", "pw", role="user")
+        self.client.post('/login', data={'username': 'reg', 'password': 'pw'})
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('KOSYNC_PORT', None)
+            page = self.client.get('/account').get_data(as_text=True)
+
+        self.assertIn('var syncPort = ""', page)
+        self.assertNotIn('var syncPort = "5757"', page)
+        self.assertIn("var splitPort = syncPort !== '' && syncPort !== '5757'", page)
+        self.assertIn("(location.protocol === 'https:' || !splitPort)", page)
+        self.assertNotIn('KOSync listens on port', page)
+
+    def test_account_keeps_browser_port_when_kosync_port_is_the_main_port(self):
+        """KOSYNC_PORT=5757 does not start the split-port listener, so the
+        suggestion must stay on the browser's origin."""
+        self.svc.create_user("reg", "pw", role="user")
+        self.client.post('/login', data={'username': 'reg', 'password': 'pw'})
+
+        with patch.dict(os.environ, {'KOSYNC_PORT': '5757'}):
+            page = self.client.get('/account').get_data(as_text=True)
+
+        self.assertIn('var syncPort = "5757"', page)
+        self.assertIn("var splitPort = syncPort !== '' && syncPort !== '5757'", page)
+        self.assertNotIn('KOSync listens on port', page)
 
     def test_account_warns_and_blocks_copy_for_loopback_url(self):
         self.svc.create_user("reg", "pw", role="user")
@@ -1268,6 +1299,32 @@ class TestMultiUserAuth(unittest.TestCase):
         # The admin's book is untouched.
         self.assertIsNotNone(self.svc.get_book("admin-book"))
         self.assertEqual(self.svc.get_book_user_ids("admin-book"), [admin.id])
+
+    def test_regular_user_cannot_trigger_readalong_epub_on_another_users_book(self):
+        """Phase 6a: the read-along actions are per-book, gated the same way as
+        remap-alignment/clear-progress/mark-complete -- a user who has not
+        claimed the book gets 403 on all three new endpoints, and no job row
+        or background work is ever queued for it."""
+        admin = self.svc.get_user_by_username("admin")
+        self.svc.save_book(Book(abs_id="admin-book", abs_title="Admin Book",
+                                ebook_filename="a.epub", audio_source="BookOrbit",
+                                status="active", user_id=admin.id))
+        self.svc.create_user("reg", "pw", role="user")
+        self.client.post('/login', data={'username': 'reg', 'password': 'pw'})  # not a claimant
+
+        with patch("src.web_server._spawn_user_background") as mock_spawn:
+            resp = self.client.post('/api/readalong-epub/admin-book', follow_redirects=False)
+            self.assertEqual(resp.status_code, 403)
+            mock_spawn.assert_not_called()
+
+        self.assertEqual(
+            self.client.get('/api/readalong-epub/admin-book/status', follow_redirects=False).status_code, 403
+        )
+        self.assertEqual(
+            self.client.post('/api/readalong-epub/admin-book/remove', follow_redirects=False).status_code, 403
+        )
+        # No job was ever recorded for the book the requester doesn't own.
+        self.assertIsNone(self.svc.get_latest_job("admin-book"))
 
     def test_match_queue_stamps_owner_and_deduplicates_per_user(self):
         import src.web_server as web_server

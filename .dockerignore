@@ -5,6 +5,7 @@
 # Documentation
 README.md
 *.md
+!RELEASE_NOTES.md
 LICENSE
 
 # Development files

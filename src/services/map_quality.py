@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from statistics import median
 from typing import Dict, List, Optional, Tuple
 
+from src.utils.ebook_dom_map import strip_inline_joiner
+
 # The interpolated-gap reference deliberately matches
 # AlignmentService._CTC_MAX_GAP_FRACTION (0.25): a map whose worst gap already
 # fails that acceptance gate should also score near zero on this axis.
@@ -610,8 +612,15 @@ _WORD_TOKEN_RE = re.compile(r"[a-z0-9']+")
 
 def _word_tokens(text: str) -> List[str]:
     """Lowercase word tokens, matching the probe scripts behind the calibration
-    table above."""
-    return _WORD_TOKEN_RE.findall((text or "").lower())
+    table above.
+
+    Strips ``INLINE_TEXT_JOINER`` first: ``_WORD_TOKEN_RE`` doesn't include it,
+    so left in place it would split a bionic-reading mid-word join (e.g.
+    ebook text "th<JOINER>e") back into two tokens ("th", "e"), the exact
+    thing the joiner exists to prevent for word-level comparisons like
+    :func:`transcript_text_overlap`.
+    """
+    return _WORD_TOKEN_RE.findall(strip_inline_joiner((text or "").lower()))
 
 
 def transcript_text_overlap(transcript_text: str, ebook_text: str,

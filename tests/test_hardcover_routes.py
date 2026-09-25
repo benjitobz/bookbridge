@@ -69,6 +69,9 @@ class MockContainer:
     def sync_manager(self):
         return Mock()
 
+    def forge_service(self):
+        return Mock()
+
     def booklore_client(self):
         return Mock()
 

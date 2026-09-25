@@ -317,3 +317,49 @@ class TestClearProgressMethod(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestClearProgressClearsKoreaderStatus(TestClearProgressMethod):
+    """Clearing progress must also tell the reader devices to forget the status.
+
+    The usual reason to clear a book is being about to re-read it, so leaving
+    'complete' in every device's sidecar makes the clear look like it did nothing.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._old_gate = os.environ.get('KOREADER_STATUS_SYNC_ENABLED')
+        os.environ['KOREADER_STATUS_SYNC_ENABLED'] = 'true'
+        # A device had already reported this book as finished.
+        self.db_service.upsert_koreader_book_status(
+            device='kindle', device_id='kindle', user_id=self.test_user.id,
+            books=[{"md5": 'test-hash-123', "status": "complete", "modified": "2026-01-01"}],
+        )
+
+    def tearDown(self):
+        if self._old_gate is None:
+            os.environ.pop('KOREADER_STATUS_SYNC_ENABLED', None)
+        else:
+            os.environ['KOREADER_STATUS_SYNC_ENABLED'] = self._old_gate
+        super().tearDown()
+
+    def _winner(self):
+        rows = self.db_service.resolve_koreader_book_status(user_id=self.test_user.id)
+        return next((r for r in rows if r["md5"] == 'test-hash-123'), None)
+
+    def test_clear_progress_marks_the_book_unread_for_devices(self):
+        self.assertEqual(self._winner()["status"], "complete")
+
+        self.sync_manager.clear_progress('test-book-123', user_id=self.test_user.id)
+
+        winner = self._winner()
+        self.assertIsNotNone(winner, "the clear must leave a row for devices to apply")
+        self.assertEqual(winner["status"], "unread")
+        self.assertEqual(winner["source_device_key"], "bridge")
+
+    def test_gate_off_leaves_device_status_alone(self):
+        os.environ['KOREADER_STATUS_SYNC_ENABLED'] = 'false'
+
+        self.sync_manager.clear_progress('test-book-123', user_id=self.test_user.id)
+
+        self.assertEqual(self._winner()["status"], "complete")

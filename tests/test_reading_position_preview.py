@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from src.services.reading_position_preview import build_reading_position_preview
+from src.utils.ebook_dom_map import INLINE_TEXT_JOINER
 
 
 class FakeParser:
@@ -222,6 +223,35 @@ def test_real_epub_headings_become_compact_paragraph_boundaries():
 
     assert "\n6 ZENITH / NADIR 6.1 AUFBRUCH\n" in result["after"]
     assert "6 ZENITH / NADIR\n6.1 AUFBRUCH" not in result["after"]
+
+
+def test_heading_survives_an_inline_word_join():
+    """``_heading_groups`` re-parses spine ``content`` independently and
+    compares it against ``full_text[start:end]``; before this used the
+    shared inline-join-aware extraction, it compared against a plain
+    ``get_text(separator=' ', strip=True)`` reconstruction, which never
+    equals a slice containing ``INLINE_TEXT_JOINER`` -- silently skipping
+    heading detection for any spine item with a bionic-reading inline
+    word split (e.g. ``<h1>6 <b>Z</b>ENITH</h1>``)."""
+    text = f"Before warning. 6 Z{INLINE_TEXT_JOINER}ENITH Portia sees art."
+    html = (
+        "<html><body><p>Before warning.</p>"
+        "<h1>6 <b>Z</b>ENITH</h1>"
+        "<p>Portia sees art.</p></body></html>"
+    )
+    parser = _heading_parser(html, text)
+    parser.xpath_result = text.index("warning") + 3
+
+    result = build_reading_position_preview(
+        book=_book(),
+        states=[_state(xpath="/body/p[1]/text().0")],
+        last_leader="kosync",
+        ebook_parser=parser,
+        context_chars=300,
+    )
+
+    assert INLINE_TEXT_JOINER not in result["after"]
+    assert "\n6 ZENITH\n" in result["after"]
 
 
 def test_duplicate_heading_text_is_left_in_plain_flow_when_mapping_is_ambiguous():

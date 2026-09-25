@@ -386,6 +386,8 @@ class ClientPoller:
         if not sync_client or not sync_client.is_configured():
             return 0
 
+        from src.services.write_tracker import marker_echo_verdict
+
         # Per-user poll: restrict to the books this user actually claimed. The
         # catalog is shared, so scanning every active book wastes a network call
         # per book and — where two users share a client (same KoSync account) —
@@ -437,7 +439,20 @@ class ClientPoller:
                 elif marker_changed:
                     # Check write-suppression before acting.
                     recent = self._recent_self_write(client_name, book.abs_id, user_id)
-                    if recent is not None:
+                    # A client-supplied position marker (#447) is judged by identity
+                    # first: True/False settles echo-vs-foreign outright; None (no
+                    # marker on either side) falls back to the percentage match below.
+                    echo_verdict = marker_echo_verdict(recent, current_state.current.get('_position_marker'))
+                    if echo_verdict is True:
+                        logger.debug(
+                            f"📡 {client_name} poll: Ignoring self-triggered change for '{book.abs_title}'"
+                        )
+                    elif echo_verdict is False:
+                        self._trigger_or_defer_sync(
+                            client_name, book, last_pct, current_pct,
+                            wait_for_settle, during_suppression=True, user_id=user_id,
+                        )
+                    elif recent is not None:
                         recent_pct = recent.get("pct")
                         if (
                             recent_pct is not None
@@ -461,11 +476,16 @@ class ClientPoller:
                     # suppression window, so a position that is still just an echo of
                     # our own push must not bounce a sync back.
                     recent = self._recent_self_write(client_name, book.abs_id, user_id)
-                    recent_pct = recent.get("pct") if recent else None
-                    still_self_echo = recent is not None and (
-                        recent_pct is None
-                        or abs(current_pct - recent_pct) <= echo_tolerance
-                    )
+                    # Same identity-first precedence as the marker_changed branch above.
+                    echo_verdict = marker_echo_verdict(recent, current_state.current.get('_position_marker'))
+                    if echo_verdict is not None:
+                        still_self_echo = echo_verdict
+                    else:
+                        recent_pct = recent.get("pct") if recent else None
+                        still_self_echo = recent is not None and (
+                            recent_pct is None
+                            or abs(current_pct - recent_pct) <= echo_tolerance
+                        )
                     if still_self_echo:
                         logger.debug(
                             f"📡 {client_name} poll: '{book.abs_title}' settled at "

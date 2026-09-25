@@ -158,6 +158,79 @@ class TestCorroboration(unittest.TestCase):
                 os.environ["SYNC_REWIND_CORROBORATION_COUNT"] = saved
 
 
+class TestMultiDeviceTrail(unittest.TestCase):
+    """Two KOReader devices on one book must not corroborate each other.
+
+    KoSync PUTs are the only observations that name a device, and both devices'
+    reports land in one trail keyed by (user, client, book). Judging that combined
+    sequence lets a second device — simply reporting where it already sits — supply
+    the advancing steps that make the FIRST device's rewind look deliberate.
+    """
+
+    def setUp(self):
+        observation_trail.clear()
+
+    def tearDown(self):
+        observation_trail.clear()
+
+    def _put(self, pct, device):
+        observation_trail.record_observation(
+            "KoSync", "abs-1", pct, source="put", user_id=1, device=device,
+        )
+
+    def test_other_device_cannot_corroborate_this_devices_rewind(self):
+        """The phone jumps back and stops; the Kobo's own position is not evidence."""
+        self._put(0.80, "phone")
+        self._put(0.40, "phone")     # the jump — and the phone never reads on
+        self._put(0.85, "kobo")      # the Kobo merely reporting where it already is
+        self._put(0.86, "kobo")
+        result = observation_trail.evaluate("KoSync", "abs-1", user_id=1)
+        self.assertFalse(result.corroborated)
+        self.assertEqual(result.device, "phone")
+
+    def test_a_device_that_reads_on_from_its_own_jump_is_still_corroborated(self):
+        """Sean's case survives the device split when a second device is present."""
+        self._put(0.85, "kobo")
+        self._put(0.80, "phone")
+        self._put(0.40, "phone")
+        self._put(0.41, "phone")
+        self._put(0.42, "phone")
+        result = observation_trail.evaluate("KoSync", "abs-1", user_id=1)
+        self.assertTrue(result.corroborated)
+        self.assertEqual(result.device, "phone")
+
+    def test_single_device_trail_is_judged_whole(self):
+        """One device names itself, so nothing is filtered and device stays unset."""
+        for pct in (0.80, 0.40, 0.41, 0.42):
+            self._put(pct, "phone")
+        result = observation_trail.evaluate("KoSync", "abs-1", user_id=1)
+        self.assertTrue(result.corroborated)
+        self.assertEqual(result.device, "")
+
+    def test_same_position_from_two_devices_is_not_collapsed(self):
+        """Folding one device onto the other would delete a point from its sequence."""
+        self._put(0.50, "phone")
+        self._put(0.50, "kobo")
+        trail = observation_trail.get_trail("KoSync", "abs-1", user_id=1)
+        self.assertEqual([entry.device for entry in trail], ["phone", "kobo"])
+
+    def test_one_device_repeating_itself_still_collapses(self):
+        """The original rule is intact within a single device's own reports."""
+        self._put(0.50, "phone")
+        self._put(0.50, "phone")
+        trail = observation_trail.get_trail("KoSync", "abs-1", user_id=1)
+        self.assertEqual(len(trail), 1)
+
+    def test_describe_names_the_device_that_was_judged(self):
+        """Diagnostics have to say whose sequence the verdict came from."""
+        self._put(0.80, "phone")
+        self._put(0.40, "phone")
+        self._put(0.85, "kobo")
+        self._put(0.86, "kobo")
+        result = observation_trail.evaluate("KoSync", "abs-1", user_id=1)
+        self.assertIn("device=phone", result.describe())
+
+
 class TestShadowLogging(unittest.TestCase):
     """The shadow explains WHY the demote path decided as it did."""
 

@@ -16,6 +16,12 @@ from src.services.alignment_service import AlignmentService
 from src.utils.polisher import Polisher
 
 
+@pytest.fixture(autouse=True)
+def _mms_ctc_model(monkeypatch):
+    """These tests exercise the MMS (torch) aligner, not the QuartzNet default."""
+    monkeypatch.setenv("CTC_MODEL", "mms_fa")
+
+
 @pytest.fixture
 def service(tmp_path):
     db = DatabaseService(str(tmp_path / "gate.db"))

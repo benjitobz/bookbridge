@@ -123,9 +123,15 @@ def record_observation(
         _cleanup_stale_locked(now)
         entries = _trails.setdefault(_key(client_name, abs_id, user_id), [])
         # A client re-reporting the identical position is not new evidence that the
-        # reader is moving, so collapse it onto the existing point.
+        # reader is moving, so collapse it onto the existing point. Only ever collapse
+        # onto the SAME device: two devices sitting at the same percentage are two
+        # separate readers agreeing, and folding one onto the other would delete a
+        # point from the first device's own sequence.
         if entries and entries[-1].pct is not None and observation.pct is not None:
-            if abs(entries[-1].pct - observation.pct) < 1e-9:
+            if (
+                abs(entries[-1].pct - observation.pct) < 1e-9
+                and entries[-1].device == observation.device
+            ):
                 entries[-1] = observation
                 return
         entries.append(observation)
@@ -164,11 +170,15 @@ class Corroboration:
     span_seconds: float
     corroborated: bool
     reason: str
+    # Which device's own sequence was judged, when the trail carried more than one
+    # (KoSync PUTs are the only source that names a device). Empty otherwise.
+    device: str = ""
 
     def describe(self) -> str:
+        device_note = f", device={self.device}" if self.device else ""
         return (
             f"trail={self.observations} obs over {self.span_seconds:.0f}s "
-            f"({','.join(self.sources) or 'none'}), advancing={self.advancing}, "
+            f"({','.join(self.sources) or 'none'}){device_note}, advancing={self.advancing}, "
             f"corroborated={self.corroborated} ({self.reason})"
         )
 
@@ -181,7 +191,37 @@ def required_observations() -> int:
         return 2
 
 
-def evaluate(client_name: str, abs_id: str, user_id=None) -> Corroboration:
+def _last_backward_index(trail: List["Observation"]) -> int:
+    """Index of the most recent backward step, or 0 when the trail only advances."""
+    for index in range(len(trail) - 1, 0, -1):
+        if trail[index].pct < trail[index - 1].pct - 1e-9:
+            return index
+    return 0
+
+
+def _device_under_judgement(trail: List["Observation"]) -> Optional[str]:
+    """Which device's own sequence to judge, or None to judge the trail whole.
+
+    KoSync device PUTs are the only source that names a device, so a trail from a
+    single device — or from the poll/socket paths, which name none — returns None
+    and is evaluated exactly as before.
+
+    Two devices reading one book interleave into one trail, and the combined
+    sequence is nobody's story: a higher number arriving from the OTHER device
+    looks like an advancing step but is a different position, not this reader
+    carrying on. The jump under judgement belongs to whichever device reported it,
+    so that device is the one that has to show it kept reading.
+    """
+    devices = {entry.device for entry in trail}
+    if len(devices) <= 1:
+        return None
+    anchor_index = _last_backward_index(trail)
+    if anchor_index:
+        return trail[anchor_index].device
+    return trail[-1].device
+
+
+def evaluate(client_name: str, abs_id: str, user_id=None, device: Optional[str] = None) -> Corroboration:
     """Judge whether `client_name`'s trail shows the reader moving on from a jump.
 
     The anchor is derived from the trail, never supplied by the caller. The obvious
@@ -195,15 +235,22 @@ def evaluate(client_name: str, abs_id: str, user_id=None) -> Corroboration:
     kept reading, while [0.48, 0.49, 0.50, 0.31] is someone who read forward and
     then jumped — identical advancing-step counts, opposite meanings. With no
     backward step in the window, the oldest observation is the anchor.
+
+    When the trail holds more than one device, only the device that reported the
+    jump is judged (see `_device_under_judgement`) — otherwise a second KOReader
+    device reporting where it already sits reads as this reader advancing.
+
+    Pass `device` to ask about one named device instead of letting the trail choose:
+    the device arbiter asks that question of each device in turn.
     """
     trail = [entry for entry in get_trail(client_name, abs_id, user_id=user_id) if entry.pct is not None]
     needed = required_observations()
 
-    anchor_index = 0
-    for index in range(len(trail) - 1, 0, -1):
-        if trail[index].pct < trail[index - 1].pct - 1e-9:
-            anchor_index = index
-            break
+    judged_device = device if device is not None else _device_under_judgement(trail)
+    if judged_device is not None:
+        trail = [entry for entry in trail if entry.device == judged_device]
+
+    anchor_index = _last_backward_index(trail)
 
     # Everything reported here describes the window SINCE the jump, so that the
     # counts and the source list in the log line cannot disagree with each other.
@@ -214,7 +261,7 @@ def evaluate(client_name: str, abs_id: str, user_id=None) -> Corroboration:
     if len(since_anchor) < needed:
         return Corroboration(
             observations=len(since_anchor), advancing=0, sources=sources, span_seconds=span,
-            corroborated=False,
+            corroborated=False, device=judged_device or "",
             reason=f"only {len(since_anchor)} observation(s) since the jump, need {needed}",
         )
 
@@ -225,7 +272,7 @@ def evaluate(client_name: str, abs_id: str, user_id=None) -> Corroboration:
     corroborated = advancing >= needed - 1
     return Corroboration(
         observations=len(since_anchor), advancing=advancing, sources=sources, span_seconds=span,
-        corroborated=corroborated,
+        corroborated=corroborated, device=judged_device or "",
         reason=(
             f"{advancing} advancing step(s) since the jump" if corroborated
             else f"only {advancing} advancing step(s) since the jump"

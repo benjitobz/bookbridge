@@ -67,29 +67,34 @@ maps can be rebuilt from existing wordTimeline data without running Whisper agai
 Use the isolated excerpt comparison first; do not clear the whole library's cache
 just to evaluate this change.
 
-## Optional CTC backend
+## Optional MMS backend (non-English books)
 
-Build with `--build-arg INSTALL_CTC=true` to include torch and torchaudio, enable
-**Use CTC forced alignment** in Settings, and use **Remap alignment** on the book's
-reset menu. `CTC_DEVICE=auto` selects CUDA when available. Both model emissions and
-target tokens remain on that device through `forced_align`; only the finished path
-and scores move to CPU for word-span reduction. This follows the device requirements
-in [torchaudio's CUDA implementation](https://github.com/pytorch/audio/blob/main/src/libtorchaudio/forced_align/gpu/compute.cu).
+Forced alignment defaults to QuartzNet, which needs no build and runs on the CPU in
+every published image, English only. For a book that is not in English, switch **CTC
+Model** to `mms_fa` (Meta MMS, ~1000 languages) under **Advanced — forced alignment
+model** in Settings. MMS is not included in the published images: build with
+`--build-arg INSTALL_CTC=true` to include torch and torchaudio, select `mms_fa`, and
+use **Remap alignment** on the book's reset menu. `CTC_DEVICE=auto` selects CUDA when
+available. Both model emissions and target tokens remain on that device through
+`forced_align`; only the finished path and scores move to CPU for word-span reduction.
+This follows the device requirements in [torchaudio's CUDA implementation](https://github.com/pytorch/audio/blob/main/src/libtorchaudio/forced_align/gpu/compute.cu).
 Logs distinguish audio decoding, emission progress and the final alignment device.
 
 For an existing lexical map with matching EPUB length and transcript matches spanning
 at least 90% of its recorded audio duration, remapping uses the EPUB chapters containing
 those matches. Synthetic head/tail anchors do not count as narration evidence. This
-keeps an unnarrated bonus excerpt out of the CTC target without changing canonical EPUB
+keeps an unnarrated bonus excerpt out of the MMS target without changing canonical EPUB
 offsets or the stored full-text length. The final anchor stays at the narrated section's
 end. Without this evidence, the backend uses the complete text; automatic matching of
 different editions or interior omissions remains outside this boundary selection.
 
-Long books still require substantial host memory even with CUDA. On CPU, maps exceeding
-the signed 32-bit back-pointer index limit fall back to lexical alignment before calling
-the native implementation. Listen at representative mapped positions before claiming
-an accuracy improvement; successful GPU execution alone does not measure accuracy.
+Long books still require substantial host memory with MMS even on CUDA. On CPU, maps
+exceeding the signed 32-bit back-pointer index limit fall back to lexical alignment
+before calling the native implementation. Listen at representative mapped positions
+before claiming an accuracy improvement; successful GPU execution alone does not
+measure accuracy.
 
-Deploy these source fixes with a restart if the running image already includes the CTC
-dependencies. Otherwise rebuild with the CTC build argument first. Keep `TORCH_HOME`
-under a persisted model-cache directory to reuse the downloaded MMS model.
+Deploy these source fixes with a restart if the running image already includes the MMS
+dependencies. Otherwise rebuild with the CTC build argument first. `TORCH_HOME` only
+matters for MMS; keep it under a persisted model-cache directory to reuse the downloaded
+MMS model. QuartzNet does not use it.

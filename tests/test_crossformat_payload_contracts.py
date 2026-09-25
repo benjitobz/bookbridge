@@ -252,6 +252,8 @@ def test_storyteller_update_returns_rich_updated_state():
     result = client.update_progress(book, request)
 
     assert result.success is True
+    posted_timestamp = storyteller_api.update_position.call_args.kwargs["timestamp"]
+    assert result.updated_state.pop("_position_marker") == posted_timestamp
     assert result.updated_state == {
         "pct": 0.61,
         "href": "OEBPS/Text/part0083.xhtml",

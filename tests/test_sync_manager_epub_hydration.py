@@ -2,7 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from src.db.models import Book
+from src.db.models import Book, JOB_KIND_ALIGNMENT, JOB_KIND_READALONG
 from src.sync_manager import SyncManager
 
 
@@ -208,8 +208,10 @@ def test_promote_alignment_backed_book_repairs_storyteller_marker_and_job(tmp_pa
     assert promoted is True
     assert book.transcript_file == "DB_MANAGED"
     manager.database_service.save_book.assert_called_once_with(book)
+    manager.database_service.get_latest_job.assert_called_once_with("book-1", kind=JOB_KIND_ALIGNMENT)
     manager.database_service.update_latest_job.assert_called_once_with(
         "book-1",
+        kind=JOB_KIND_ALIGNMENT,
         progress=1.0,
         retry_count=0,
         last_error=None,
@@ -234,6 +236,55 @@ def test_promote_alignment_backed_book_returns_false_without_alignment(tmp_path)
     assert promoted is False
     assert book.transcript_file is None
     manager.database_service.save_book.assert_not_called()
+    manager.database_service.update_latest_job.assert_not_called()
+
+
+def test_promote_alignment_backed_book_never_touches_a_readalong_kind_job(tmp_path):
+    """The regression this exists for: a normal sync cycle calling
+    `_promote_alignment_backed_book` must not falsely complete an in-flight
+    read-along generation job. `get_latest_job`/`update_latest_job` are now
+    scoped to `kind=JOB_KIND_ALIGNMENT`, so a mock standing in for a real,
+    kind-filtered `DatabaseService` (one that only returns a job when the
+    kind matches) proves the promotion path never sees or writes to a
+    `readalong`-kind row -- it isn't enough to assert call args when the
+    fixture ignores them, so this fixture actually enforces the filter."""
+    manager = _build_manager(tmp_path)
+    manager.alignment_service = MagicMock()
+    manager.alignment_service._get_alignment.return_value = {"ok": True}
+
+    readalong_job = SimpleNamespace(progress=0.0, retry_count=0, last_error=None, kind=JOB_KIND_READALONG)
+
+    def _get_latest_job(abs_id, kind=None):
+        # Mirrors real DatabaseService.get_latest_job: unfiltered (kind=None,
+        # the pre-fix call shape) returns the newest job regardless of kind --
+        # here, the only job that exists, the in-flight read-along one.
+        # Filtered to JOB_KIND_ALIGNMENT it correctly finds nothing.
+        if kind is None or kind == JOB_KIND_READALONG:
+            return readalong_job
+        return None
+
+    def _update_latest_job(abs_id, kind=None, **kwargs):
+        if kind is None or kind == JOB_KIND_READALONG:
+            for key, value in kwargs.items():
+                setattr(readalong_job, key, value)
+            return readalong_job
+        return None
+
+    manager.database_service.get_latest_job.side_effect = _get_latest_job
+    manager.database_service.update_latest_job.side_effect = _update_latest_job
+
+    book = Book(
+        abs_id="book-readalong",
+        abs_title="Readalong In Flight",
+        transcript_file="DB_MANAGED",
+        status="active",
+    )
+
+    promoted = manager._promote_alignment_backed_book(book)
+
+    assert promoted is True
+    # The read-along job is untouched: still 0 progress, no error cleared.
+    assert readalong_job.progress == 0.0
     manager.database_service.update_latest_job.assert_not_called()
 
 

@@ -19,6 +19,7 @@ class MockContainer:
         
     def database_service(self): return self.mock_database_service
     def sync_manager(self): return self.mock_sync_manager
+    def forge_service(self): return Mock()
     def abs_client(self): return Mock()
     def booklore_client(self): return Mock()
     def bookfusion_client(self): return Mock()

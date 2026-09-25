@@ -76,6 +76,15 @@ class BookOrbitSyncClient(SyncClient):
             return None
         return self.client.find_book_by_filename(epub, allow_refresh=False)
 
+    def resolve_bookorbit_book_id(self, book: Book):
+        """The BookOrbit entry id this book's ebook maps to, or None.
+
+        Public because the sync cycle has to compare it against the audio side's
+        entry id to spot the two formats sharing one entry, which is what makes
+        BookOrbit's read-along sync mirror BookBridge's writes.
+        """
+        return (self._resolve_book_info(book) or {}).get("id")
+
     def supports_book(self, book: Book) -> bool:
         # An explicit ebook source is authoritative — never hijack a book that
         # belongs to Grimmory/CWA/ABS/etc. just because BookOrbit also hosts the

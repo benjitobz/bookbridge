@@ -55,6 +55,22 @@
                 {% endif %}
             </div>
             {% endif %}
+
+            <div class="card-feature-badges">
+                <span class="ctc-alignment-badge" title="CTC word alignment is ready"
+                    {% if not mapping.ctc_aligned %}hidden{% endif %}>CTC</span>
+                <span class="readalong-badge" role="img" aria-label="Read-along EPUB ready"
+                    title="Read-along EPUB ready" {% if not mapping.readalong_ready %}hidden{% endif %}>
+                    <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                        <path d="M4.5 13.5a7.5 7.5 0 0 1 15 0" fill="none" stroke="currentColor"
+                            stroke-width="2" stroke-linecap="round"/>
+                        <rect x="2.5" y="12.5" width="3.6" height="6.5" rx="1.8" fill="currentColor"/>
+                        <rect x="17.9" y="12.5" width="3.6" height="6.5" rx="1.8" fill="currentColor"/>
+                        <path d="M12 11.6c-1.4-.9-3.1-1.2-4.7-1v7.6c1.6-.2 3.3.1 4.7 1z" fill="currentColor"/>
+                        <path d="M12 11.6c1.4-.9 3.1-1.2 4.7-1v7.6c-1.6-.2-3.3.1-4.7 1z" fill="currentColor"/>
+                    </svg>
+                </span>
+            </div>
         </div>
 
         {# Info section - always visible #}
@@ -355,8 +371,6 @@
             <div class="card-footer">
                 <div class="last-sync">
                     <span class="last-sync-age">Synced {{ mapping.last_sync }}</span>
-                    <span class="ctc-alignment-badge" title="CTC word alignment is ready"
-                        {% if not mapping.ctc_aligned %}hidden{% endif %}>CTC</span>
                 </div>
                 <div class="quick-actions">
                     <button type="button" class="action-btn" onclick="syncNow('{{ mapping.abs_id }}', this)"
@@ -375,6 +389,13 @@
                                 data-ctc-aligned="{{ 'true' if mapping.ctc_aligned else 'false' }}"
                                 {% if mapping.ctc_aligned %}disabled title="This book already has a CTC alignment map"{% endif %}
                                 onclick='remapAlignment({{ mapping.abs_id|tojson }}, this)'>{{ '✓ Already using CTC' if mapping.ctc_aligned else '🎯 Remap alignment' }}</button>
+                            <button type="button" role="menuitem" class="reset-menu-item readalong-generate-btn"
+                                {% if not mapping.readalong_eligible %}title="{{ mapping.readalong_ineligible_reason }}"{% endif %}
+                                onclick='generateReadalongEpub({{ mapping.abs_id|tojson }}, this)'>📖 Create read-along EPUB</button>
+                            {% if mapping.readalong_audio_ok %}
+                            <button type="button" role="menuitem" class="reset-menu-item readalong-remove-btn"
+                                onclick='removeReadalongEpub({{ mapping.abs_id|tojson }}, this)'>🗑️ Remove read-along EPUB</button>
+                            {% endif %}
                         </div>
                     </div>
                     <form method="POST" action="/delete/{{ mapping.abs_id }}">
@@ -1041,14 +1062,44 @@
         }
 
         .reset-menu { position: relative; display: inline-block; }
+        .card-feature-badges {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+        }
+        .card-feature-badges:has(> :not([hidden])) {
+            margin-top: 4px;
+        }
+        .ctc-alignment-badge,
+        .readalong-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            height: 20px;
+            border-radius: 999px;
+        }
+        .ctc-alignment-badge[hidden],
+        .readalong-badge[hidden] {
+            display: none;
+        }
         .ctc-alignment-badge {
-            margin-left: 5px;
-            padding: 2px 5px;
-            border-radius: 4px;
+            padding: 0 8px;
             background: rgba(79, 195, 247, 0.18);
             color: var(--reading, #4fc3f7);
             font-size: 9px;
             font-weight: 700;
+            letter-spacing: 0.04em;
+        }
+        .readalong-badge {
+            width: 38px;
+            background: linear-gradient(135deg, #5cc0ff 0%, #2f8cf5 55%, #1f64dc 100%);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 1px 3px rgba(20, 70, 170, 0.45);
+            color: #fff;
+        }
+        .readalong-badge svg {
+            width: 16px;
+            height: 16px;
+            filter: drop-shadow(0 1px 0.5px rgba(10, 40, 110, 0.35));
         }
         /* Portaled to <body> and positioned in JS (position:fixed) so the card's
            overflow:hidden and hover transform can neither clip it nor paint over it. */
@@ -2016,11 +2067,88 @@
                 transform: translateY(0);
             }
         }
+
+        .whats-new-banner {
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.18) 0%, rgba(118, 75, 162, 0.18) 100%);
+            border: 1px solid rgba(102, 126, 234, 0.3);
+            border-radius: var(--radius-lg);
+            padding: 14px 20px;
+            margin-bottom: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        .whats-new-banner-body {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+            color: var(--text);
+            font-size: 0.92rem;
+        }
+
+        .whats-new-banner-headline { font-weight: 600; }
+
+        .whats-new-banner-link {
+            color: var(--accent);
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .whats-new-banner-link:hover { text-decoration: underline; }
+
+        .whats-new-banner-sep { color: var(--muted-soft); }
+
+        .whats-new-banner-action { color: var(--text); }
+        .whats-new-banner-action strong { color: #f6ad55; }
+
+        .whats-new-banner-close {
+            background: none;
+            border: none;
+            color: var(--muted);
+            font-size: 1rem;
+            cursor: pointer;
+            line-height: 1;
+            padding: 4px 8px;
+            border-radius: 6px;
+            transition: background 0.2s, color 0.2s;
+        }
+
+        .whats-new-banner-close:hover {
+            background: rgba(255, 255, 255, 0.08);
+            color: var(--text);
+        }
 </style>
 {% endblock %}
 
 {% block content %}
     <div class="container">
+        {% if whats_new %}
+        <div id="whats-new-banner" class="whats-new-banner">
+            <div class="whats-new-banner-body">
+                <span class="whats-new-banner-headline">BookBridge updated to {{ whats_new.version }}</span>
+                <a href="/whats-new" class="whats-new-banner-link">What's new</a>
+                {% if whats_new.action_items %}
+                <span class="whats-new-banner-sep">&middot;</span>
+                <span class="whats-new-banner-action"><strong>Action required:</strong> {{ whats_new.action_items | join(' · ') }}</span>
+                {% endif %}
+            </div>
+            <button type="button" class="whats-new-banner-close" onclick="dismissWhatsNewBanner()" aria-label="Dismiss">✕</button>
+        </div>
+        <script>
+            function dismissWhatsNewBanner() {
+                fetch('/whats-new/dismiss', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                }).catch(function (e) { console.debug('whats-new dismiss failed', e); });
+                var el = document.getElementById('whats-new-banner');
+                if (el) el.remove();
+            }
+        </script>
+        {% endif %}
         <!-- Forge Status Banner -->
         <div id="forge-status-banner" class="forge-banner" style="display: none;">
             <div style="display: flex; align-items: center; gap: 12px;">
@@ -3174,6 +3302,7 @@
                             const card = document.querySelector(`.book-card[data-abs-id="${book.abs_id}"]`);
                             if (!card) return;
                             updateCtcAlignmentStatus(card, book.ctc_aligned === true);
+                            updateReadalongStatus(card, book.readalong_ready === true);
 
                             // Update progress percentage text
                             const progressPercent = card.querySelector('.progress-percent');
@@ -3406,6 +3535,15 @@
                     });
             }
 
+            function updateReadalongStatus(card, ready) {
+                const badge = card && card.querySelector('.readalong-badge');
+                if (badge) badge.hidden = !ready;
+            }
+
+            function _setReadalongBadge(absId, ready) {
+                updateReadalongStatus(document.querySelector(`.book-card[data-abs-id="${absId}"]`), ready);
+            }
+
             function updateCtcAlignmentStatus(card, isCtc) {
                 const badge = card.querySelector('.ctc-alignment-badge');
                 if (badge) badge.hidden = !isCtc;
@@ -3508,6 +3646,87 @@
                             if (btn.dataset.ctcAligned === 'true') return;
                             btn.innerHTML = originalText; btn.disabled = false;
                         }, 3000);
+                    });
+            }
+
+            function _pollReadalongEpubStatus(absId, btn, originalText) {
+                fetch('/api/readalong-epub/' + absId + '/status')
+                    .then(response => response.json())
+                    .then(data => {
+                        if (data.state === 'running') {
+                            // Show real stage/progress signal instead of a static
+                            // "generating" message -- a long book's ffmpeg transcode
+                            // alone can run several minutes with no other feedback.
+                            const label = data.stage_label || 'Generating';
+                            const pct = (typeof data.percent === 'number') ? ' ' + data.percent + '%' : '';
+                            btn.innerHTML = '⏳ ' + label + '…' + pct;
+                            setTimeout(() => _pollReadalongEpubStatus(absId, btn, originalText), 5000);
+                            return;
+                        }
+                        if (data.state === 'done') {
+                            btn.innerHTML = data.warning ? '⚠️ Delivered (unconfirmed)' : '✅ Read-along ready';
+                            _setReadalongBadge(absId, true);
+                        } else if (data.state === 'failed') {
+                            const stagePrefix = data.stage_label ? data.stage_label + ': ' : '';
+                            btn.innerHTML = '❌ ' + stagePrefix + (data.error || 'Failed');
+                        } else {
+                            btn.innerHTML = originalText;
+                        }
+                        setTimeout(() => { btn.innerHTML = originalText; btn.disabled = false; }, 5000);
+                    }).catch(error => {
+                        console.debug('Read-along status check failed', error);
+                        setTimeout(() => _pollReadalongEpubStatus(absId, btn, originalText), 8000);
+                    });
+            }
+
+            function generateReadalongEpub(absId, btn) {
+                btn.disabled = true;
+                const originalText = btn.innerHTML;
+                btn.innerHTML = '⏳ Queuing…';
+                fetch('/api/readalong-epub/' + absId, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                }).then(response => response.json())
+                    .then(data => {
+                        if (data.success) {
+                            btn.innerHTML = '⏳ Generating… (this can take minutes)';
+                            setTimeout(() => _pollReadalongEpubStatus(absId, btn, originalText), 5000);
+                        } else {
+                            btn.innerHTML = '❌ ' + (data.error || 'Failed');
+                            setTimeout(() => { btn.innerHTML = originalText; btn.disabled = false; }, 4000);
+                        }
+                    }).catch(error => {
+                        console.error('Read-along generation error:', error);
+                        btn.innerHTML = '❌ Failed';
+                        setTimeout(() => { btn.innerHTML = originalText; btn.disabled = false; }, 4000);
+                    });
+            }
+
+            function removeReadalongEpub(absId, btn) {
+                if (!confirm('Remove the generated read-along EPUB for this book?')) {
+                    return;
+                }
+                btn.disabled = true;
+                const originalText = btn.innerHTML;
+                btn.innerHTML = '⏳ Removing…';
+                fetch('/api/readalong-epub/' + absId + '/remove', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                }).then(response => response.json())
+                    .then(data => {
+                        if (data.success && data.removed) {
+                            btn.innerHTML = '✅ Removed';
+                            _setReadalongBadge(absId, false);
+                        } else if (data.success) {
+                            btn.innerHTML = 'ℹ️ Nothing to remove';
+                        } else {
+                            btn.innerHTML = '❌ ' + (data.error || 'Failed');
+                        }
+                        setTimeout(() => { btn.innerHTML = originalText; btn.disabled = false; }, 3000);
+                    }).catch(error => {
+                        console.error('Read-along removal error:', error);
+                        btn.innerHTML = '❌ Failed';
+                        setTimeout(() => { btn.innerHTML = originalText; btn.disabled = false; }, 3000);
                     });
             }
 

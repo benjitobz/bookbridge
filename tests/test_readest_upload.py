@@ -111,6 +111,9 @@ def _make_client(book_hash: str = "hash1") -> MagicMock:
     client.is_configured.return_value = True
     client.compute_book_hash.return_value = book_hash
     client.pull_books.return_value = []
+    # Empty storage is part of "new book": cloud presence is now consulted even
+    # when no library row comes back, so leave nothing to MagicMock's defaults.
+    client.list_files.return_value = []
     client.upload_file.return_value = {"usage": 1, "quota": 100}
     client.push_books.return_value = True
     return client
@@ -364,6 +367,75 @@ class TestReadestUploadServiceCloudPresenceDetection(unittest.TestCase):
 
         client.upload_file.assert_not_called()
         self.assertEqual(result.status, "updated")
+
+    # -- REGRESSION: bytes present but no library row (the import race) -----
+    #
+    # Measured live 2026-09-20 on 'Forbidden Temptation Volume 2'. The reader
+    # imported the book at 16:46 and Readest's own file-sync put the blob in
+    # storage under a title-keyed name; the sweep ran at 16:50, `pull_books`
+    # returned no row for the hash, and the bridge uploaded the same 242,992
+    # bytes a second time AND pushed a record carrying no `progress`.
+    #
+    # Two distinct harms, one cause: `_book_bytes_present` returned False
+    # without ever asking storage whenever the server row was missing.
+
+    def test_bytes_present_without_server_row_is_not_reuploaded(self):
+        client = _make_client(book_hash=self.BOOK_HASH)
+        client.pull_books.return_value = []  # row not visible to this pull yet
+        client.cover_file_name.return_value = self.COVER_KEY
+        # Readest's own app uploaded the blob under ITS key, not ours.
+        client.list_files.return_value = [
+            {"file_key": f"Readest/Books/{self.BOOK_HASH}/Some Real Title.epub"},
+            {"file_key": self.COVER_KEY},
+        ]
+        service = self._service(client)
+
+        result = service.publish_book("book.epub")
+
+        self.assertEqual(result.status, "skipped")
+        client.upload_file.assert_not_called()
+
+    def test_bytes_present_without_server_row_does_not_push_a_record(self):
+        """The position-wipe half: a push with no row to carry `progress` from
+        NULLs the reader's position server-side. Skip the push entirely."""
+        client = _make_client(book_hash=self.BOOK_HASH)
+        client.pull_books.return_value = []
+        client.cover_file_name.return_value = self.COVER_KEY
+        client.list_files.return_value = [{"file_key": self.BOOK_KEY}]
+        service = self._service(client)
+
+        service.publish_book("book.epub")
+
+        client.push_books.assert_not_called()
+
+    def test_no_row_and_no_bytes_still_uploads(self):
+        """The genuinely-new book must be unaffected by the guard above."""
+        client = _make_client(book_hash=self.BOOK_HASH)
+        client.pull_books.return_value = []
+        client.cover_file_name.return_value = self.COVER_KEY
+        client.list_files.return_value = []  # storage is empty
+        client.book_file_name.return_value = self.BOOK_KEY
+        service = self._service(client)
+
+        result = service.publish_book("book.epub")
+
+        client.upload_file.assert_called()
+        client.push_books.assert_called_once()
+        self.assertEqual(result.status, "created")
+
+    def test_no_row_and_failed_storage_lookup_stays_pessimistic(self):
+        """A transient `list_files` error with no row proves nothing; upload."""
+        client = _make_client(book_hash=self.BOOK_HASH)
+        client.pull_books.return_value = []
+        client.cover_file_name.return_value = self.COVER_KEY
+        client.list_files.return_value = None
+        client.book_file_name.return_value = self.BOOK_KEY
+        service = self._service(client)
+
+        result = service.publish_book("book.epub")
+
+        client.upload_file.assert_called()
+        self.assertEqual(result.status, "created")
 
 
 # ---------------------------------------------------------------------------

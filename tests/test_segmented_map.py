@@ -23,6 +23,7 @@ appendix): neither segment covers it, and no flat-map point falls in it.
 import json
 import tempfile
 import unittest
+import pytest
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -57,6 +58,12 @@ def _stub_row(mock_db, alignment_map, segments=None):
     entry.segments_json = json.dumps(segments) if segments is not None else None
     session.query.return_value.filter_by.return_value.first.return_value = entry
     return session
+
+
+@pytest.fixture(autouse=True)
+def _mms_ctc_model(monkeypatch):
+    """These tests exercise the MMS (torch) aligner, not the QuartzNet default."""
+    monkeypatch.setenv("CTC_MODEL", "mms_fa")
 
 
 class TestSegmentedMapRoundTrip(unittest.TestCase):

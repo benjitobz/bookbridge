@@ -13,6 +13,8 @@ from sqlalchemy.orm import Query
 from src.api.storyteller_api import StorytellerAPIClient
 from src.db.database_service import DatabaseService
 from src.db.models import Book
+from src.sync_clients.sync_client_interface import ServiceState
+from src.sync_manager import SyncManager
 
 
 def write_epub(path: Path) -> None:
@@ -320,3 +322,140 @@ def test_grimmory_refetch_does_not_scale_with_failing_change_count(tmp_path):
         assert len(remote_rows) == 1
     finally:
         db.db_manager.close()
+
+
+def _audio_peer_state(current: dict) -> ServiceState:
+    return ServiceState(
+        current=current,
+        previous_pct=0.0,
+        delta=0.0,
+        threshold=0.01,
+        is_configured=True,
+        display=("X", "{prev:.2%}->{curr:.2%}"),
+        value_formatter=lambda v: f"{v:.4%}",
+    )
+
+
+def _manager_for_normalization():
+    manager = SyncManager.__new__(SyncManager)
+    manager.ebook_parser = MagicMock()
+    manager.alignment_service = MagicMock()
+    manager.books_dir = None
+    manager._sync_cycle_local_epub_cache = {}
+    manager._sync_cycle_ebook_cache = {}
+    manager._get_local_epub = lambda filename: Path(f"/tmp/{filename}")
+    manager.ebook_parser.resolve_book_path.return_value = "book.epub"
+    manager.ebook_parser.extract_text_and_map.return_value = ("a" * 1000, [])
+    manager.ebook_parser.resolve_xpath_to_index.return_value = 123
+    manager.ebook_parser.resolve_cfi_to_index.return_value = None
+    manager.alignment_service.get_time_for_text.return_value = 555.0
+
+    class _Client:
+        def get_supported_sync_types(self):
+            return {"audiobook", "ebook"}
+
+        def can_be_leader(self):
+            return True
+
+        def is_configured(self):
+            return True
+
+    manager.sync_clients = {"ABS": _Client(), "KoSync": _Client()}
+    return manager
+
+
+def test_unstarted_audiobook_timestamp_is_coerced_during_normalization():
+    """An unstarted audiobook stores an explicit None under 'ts', so the `0`
+    default on .get() never fires and a None reached the leader comparison."""
+    manager = _manager_for_normalization()
+    book = SimpleNamespace(abs_id="abs-1", transcript_file="DB_MANAGED", ebook_filename="book.epub")
+    config = {
+        "ABS": _audio_peer_state({"pct": 0.0, "ts": None}),
+        "KoSync": _audio_peer_state({"pct": 0.5, "xpath": "/body/DocFragment[1]/body/p[1]/text().0"}),
+    }
+
+    normalized = manager._normalize_for_cross_format_comparison(book, config)
+
+    assert normalized["ABS"] == 0
+    assert normalized["ABS"] is not None
+
+
+def test_determine_leader_survives_unstarted_audiobook_peer():
+    """Reproduces the reported crash: 'unsupported operand type(s) for -:
+    NoneType and float' in _determine_leader when the only audio peer is an
+    unstarted book reporting ts=None."""
+    manager = _manager_for_normalization()
+    manager._has_significant_delta = MagicMock(side_effect=lambda name, cfg, book: name == "KoSync")
+
+    book = SimpleNamespace(
+        abs_id="abs-1",
+        transcript_file="DB_MANAGED",
+        ebook_filename="book.epub",
+        duration=10000,
+    )
+    config = {
+        "ABS": _audio_peer_state({"pct": 0.0, "ts": None}),
+        "KoSync": _audio_peer_state({"pct": 0.5, "xpath": "/body/DocFragment[1]/body/p[1]/text().0"}),
+    }
+
+    # Must not raise TypeError.
+    leader, leader_pct = manager._determine_leader(config, book, "abs-1", "book")
+
+    assert leader in (None, "KoSync", "ABS")
+
+
+def test_bookorbit_unstarted_audiobook_reports_zero_timestamp():
+    from src.sync_clients.bookorbit_audio_sync_client import BookOrbitAudioSyncClient
+
+    client = BookOrbitAudioSyncClient.__new__(BookOrbitAudioSyncClient)
+    client.client = MagicMock()
+    client.client.get_audiobook_progress.return_value = {"pct": 0.0, "current_file_id": None,
+                                                        "position_seconds": None, "updated_at": None}
+    client.client.get_audiobook_info.return_value = {}
+    client.client.is_configured.return_value = True
+    client.delta_abs_thresh = 0.01
+    client._resolve_book_id = MagicMock(return_value="42")
+    client._get_duration_seconds = MagicMock(return_value=3600.0)
+    client._resolve_absolute_timestamp = MagicMock(return_value=None)
+
+    state = client.get_service_state(SimpleNamespace(abs_id="abs-1"), None)
+
+    assert state.current["ts"] == 0.0
+    assert state.current["ts"] is not None
+
+
+def test_bookorbit_audiobook_without_duration_reports_zero_timestamp():
+    from src.sync_clients.bookorbit_audio_sync_client import BookOrbitAudioSyncClient
+
+    client = BookOrbitAudioSyncClient.__new__(BookOrbitAudioSyncClient)
+    client.client = MagicMock()
+    client.client.get_audiobook_progress.return_value = {"pct": 0.25, "current_file_id": None,
+                                                        "position_seconds": None, "updated_at": None}
+    client.client.get_audiobook_info.return_value = {}
+    client.client.is_configured.return_value = True
+    client.delta_abs_thresh = 0.01
+    client._resolve_book_id = MagicMock(return_value="42")
+    client._get_duration_seconds = MagicMock(return_value=None)
+    client._resolve_absolute_timestamp = MagicMock(return_value=None)
+
+    state = client.get_service_state(SimpleNamespace(abs_id="abs-1"), None)
+
+    assert state.current["ts"] == 0.0
+
+
+def test_booklore_audiobook_without_duration_reports_zero_timestamp():
+    from src.sync_clients.booklore_audio_sync_client import BookLoreAudioSyncClient
+
+    client = BookLoreAudioSyncClient.__new__(BookLoreAudioSyncClient)
+    client.booklore_client = MagicMock()
+    client.booklore_client.get_audiobook_progress.return_value = {"pct": 0.0, "updated_at": None}
+    client.booklore_client.get_audiobook_info.return_value = {}
+    client.booklore_client.is_configured.return_value = True
+    client.delta_abs_thresh = 0.01
+    client._resolve_booklore_book_id = MagicMock(return_value="42")
+    client._get_duration_seconds = MagicMock(return_value=None)
+    client._resolve_absolute_timestamp_from_progress = MagicMock(return_value=None)
+
+    state = client.get_service_state(SimpleNamespace(abs_id="abs-1"), None)
+
+    assert state.current["ts"] == 0.0

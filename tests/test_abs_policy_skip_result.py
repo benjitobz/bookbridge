@@ -62,7 +62,7 @@ class ABSPolicySkipResultTestCase(unittest.TestCase):
         result = SyncResult(700.0, True, {"ts": 700.0, "pct": 0.7})
         with patch("src.services.write_tracker.record_write") as record_write:
             manager._record_bridge_write("ABS", "book-1", result)
-        record_write.assert_called_once_with("ABS", "book-1", 0.7)
+        record_write.assert_called_once_with("ABS", "book-1", 0.7, marker=None)
 
     def test_skipped_updated_state_serialized_without_skipped_key(self):
         """Serialization guard: the skipped marker must not leak into locator_json."""

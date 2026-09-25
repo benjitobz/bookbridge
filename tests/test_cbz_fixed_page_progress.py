@@ -1249,7 +1249,7 @@ def test_abs_ebook_never_writes_fixed_page_as_cfi():
 
 
 def test_bookorbit_never_serializes_fixed_page_as_cfi():
-    client = BookOrbitClient.__new__(BookOrbitClient)
+    client = BookOrbitClient()
     client._make_request = MagicMock(return_value=SimpleNamespace(status_code=204))
 
     assert client.update_ebook_progress(
