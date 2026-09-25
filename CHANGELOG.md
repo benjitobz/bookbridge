@@ -4,7 +4,7 @@
 
 All notable changes to BookBridge will be documented in this file.
 
-## [Unreleased]
+## [7.8.0] - 2026-09-25
 
 ### Added
 
@@ -191,6 +191,28 @@ All notable changes to BookBridge will be documented in this file.
   a second device simply reporting where it already sat could supply that evidence and
   make a stale jump look intentional. Each device's own reading is now judged on its
   own.
+
+- **A BookOrbit or Grimmory audiobook you have not started no longer stops syncing
+  for its book.** An unstarted audiobook reported no position at all, and the sync cycle
+  crashed on it every time it compared positions, so nothing synced for that book
+  until you pressed play. It is now treated as sitting at the start.
+
+- **Grimmory shelf-watch no longer retries a book with no ID on every scan.** A shelf
+  entry without an ID was read as a book literally called "None", so every scan
+  tried to download it and logged a failure, forever. Entries without an ID are now
+  skipped.
+
+- **Readest no longer loses your position when a book was only just added.** When a
+  book had just arrived in Readest but its library entry had not caught up yet,
+  BookBridge uploaded the file a second time and sent a record that cleared your
+  reading position in Readest. It now checks Readest's storage first and leaves a
+  book that is already there alone until its entry appears.
+
+- **The suggested KOReader sync address uses the port you actually browse on.** The
+  **Connect a KOReader device** card on your account page always suggested port
+  5757, so on the documented `8080:5757` setup KOReader was pointed at a port nothing
+  publishes and failed with "Unknown server error". It now suggests the address in
+  your browser unless a separate KoSync port is configured.
 
 ## [7.7.0] - 2026-09-15
 
