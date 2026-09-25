@@ -46,6 +46,7 @@ from src.utils.logging_utils import memory_log_handler, LOG_PATH
 from src.utils.logging_utils import sanitize_log_data
 from src.utils.logging_utils import get_persistent_condition_logger
 from src.services.diagnostics import setup_diagnostics_logging
+from src.services import whats_new
 from src.api.api_clients import ABS_DISABLED_SENTINEL, is_abs_disabled_value
 from src.api.kosync_server import kosync_sync_bp, kosync_admin_bp, init_kosync_server, signal_manifest_rebuild
 from src.api.hardcover_routes import hardcover_bp, init_hardcover_routes
@@ -96,6 +97,9 @@ SUGGESTIONS_SCAN_JOB_TTL_SECONDS = 3600
 SUGGESTIONS_STATE_STORE = {}
 SUGGESTIONS_STATE_LOCK = threading.Lock()
 SUGGESTIONS_STATE_TTL_SECONDS = 86400
+# Per-user credential key (not a user-editable setting) recording the last
+# APP_VERSION the "what's new" banner/page was shown/dismissed for.
+WHATS_NEW_SEEN_KEY = "WHATS_NEW_SEEN_VERSION"
 SUGGESTIONS_CACHE_FILE_NAME = "suggestions_scan_cache.json"
 SUGGESTIONS_CACHE_LOCK = threading.Lock()
 # Batch-match queue lives on disk (under DATA_DIR) instead of the Flask session cookie:
@@ -5696,6 +5700,68 @@ def audiobook_matches_search(ab, search_term):
 
     return False
 
+def _build_whats_new_context(user) -> Optional[dict]:
+    """Compute the "what's new after upgrade" banner context for the Library
+    page, or None to show nothing. Never raises into the page: any failure
+    is logged at debug and treated as "no banner".
+
+    When no seen-version has been stored yet for the user and this looks
+    like a brand-new account (created by this same process), the current
+    version is silently stored as a baseline instead of announcing it.
+    """
+    if user is None:
+        return None
+    try:
+        stored = database_service.get_user_credentials(user.id).get(WHATS_NEW_SEEN_KEY)
+        decision = whats_new.should_show_banner(
+            app_version=APP_VERSION,
+            stored_value=stored,
+            user_created_at=getattr(user, "created_at", None),
+            process_started_at=whats_new.PROCESS_STARTED_AT,
+        )
+        if decision == "store_current":
+            database_service.set_user_credential(user.id, WHATS_NEW_SEEN_KEY, APP_VERSION)
+            return None
+        if decision != "show":
+            return None
+        return {
+            "version": APP_VERSION,
+            "action_items": whats_new.get_action_required_items(),
+        }
+    except Exception as e:
+        logger.debug(f"Could not compute whats-new banner state: {e}", exc_info=True)
+        return None
+
+
+def whats_new_page():
+    """GET /whats-new: renders RELEASE_NOTES.md and marks the running
+    version seen for the logged-in user."""
+    user = current_user()
+    if user is not None:
+        try:
+            database_service.set_user_credential(user.id, WHATS_NEW_SEEN_KEY, APP_VERSION)
+        except Exception as e:
+            logger.debug(f"Could not record whats-new seen version for user {user.id}: {e}", exc_info=True)
+    return render_template(
+        'whats_new.html',
+        app_version=APP_VERSION,
+        notes_html=whats_new.get_release_notes_html(),
+        action_items=whats_new.get_action_required_items(),
+    )
+
+
+def whats_new_dismiss():
+    """POST /whats-new/dismiss: marks the running version seen for the
+    logged-in user (banner "x" dismiss)."""
+    user = current_user()
+    if user is not None:
+        try:
+            database_service.set_user_credential(user.id, WHATS_NEW_SEEN_KEY, APP_VERSION)
+        except Exception as e:
+            logger.debug(f"Could not record whats-new dismiss for user {user.id}: {e}", exc_info=True)
+    return jsonify({"ok": True})
+
+
 # ---------------- ROUTES ----------------
 def index():
     """Dashboard - loads books and progress from database service"""
@@ -5729,6 +5795,7 @@ def index():
     grouped_mappings = _group_dashboard_mappings_by_series(mappings)
 
     latest_version, update_available = get_update_status()
+    whats_new_ctx = _build_whats_new_context(user)
 
     show_diagnostics_modal = (
         not env_truthy('DIAGNOSTICS_PROMPTED')
@@ -5746,7 +5813,8 @@ def index():
         app_version=APP_VERSION,
         update_available=update_available,
         latest_version=latest_version,
-        show_diagnostics_modal=show_diagnostics_modal
+        show_diagnostics_modal=show_diagnostics_modal,
+        whats_new=whats_new_ctx
     )
 
 
@@ -12991,6 +13059,8 @@ def create_app(test_container=None):
     app.add_url_rule('/api/admin/users/<int:user_id>/bookfusion/device/start', 'admin_user_bookfusion_device_start', admin_user_bookfusion_device_start, methods=['POST'])
     app.add_url_rule('/api/admin/users/<int:user_id>/bookfusion/device/poll', 'admin_user_bookfusion_device_poll', admin_user_bookfusion_device_poll, methods=['POST'])
     app.add_url_rule('/', 'index', index)
+    app.add_url_rule('/whats-new', 'whats_new_page', whats_new_page, methods=['GET'])
+    app.add_url_rule('/whats-new/dismiss', 'whats_new_dismiss', whats_new_dismiss, methods=['POST'])
     app.add_url_rule('/shelfmark', 'shelfmark', shelfmark)
     app.add_url_rule('/forge', 'forge', forge)
     app.add_url_rule('/book-linker', 'book_linker_legacy', _legacy_book_linker_redirect)

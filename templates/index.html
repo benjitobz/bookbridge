@@ -2067,11 +2067,88 @@
                 transform: translateY(0);
             }
         }
+
+        .whats-new-banner {
+            background: linear-gradient(135deg, rgba(102, 126, 234, 0.18) 0%, rgba(118, 75, 162, 0.18) 100%);
+            border: 1px solid rgba(102, 126, 234, 0.3);
+            border-radius: var(--radius-lg);
+            padding: 14px 20px;
+            margin-bottom: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        .whats-new-banner-body {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+            color: var(--text);
+            font-size: 0.92rem;
+        }
+
+        .whats-new-banner-headline { font-weight: 600; }
+
+        .whats-new-banner-link {
+            color: var(--accent);
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .whats-new-banner-link:hover { text-decoration: underline; }
+
+        .whats-new-banner-sep { color: var(--muted-soft); }
+
+        .whats-new-banner-action { color: var(--text); }
+        .whats-new-banner-action strong { color: #f6ad55; }
+
+        .whats-new-banner-close {
+            background: none;
+            border: none;
+            color: var(--muted);
+            font-size: 1rem;
+            cursor: pointer;
+            line-height: 1;
+            padding: 4px 8px;
+            border-radius: 6px;
+            transition: background 0.2s, color 0.2s;
+        }
+
+        .whats-new-banner-close:hover {
+            background: rgba(255, 255, 255, 0.08);
+            color: var(--text);
+        }
 </style>
 {% endblock %}
 
 {% block content %}
     <div class="container">
+        {% if whats_new %}
+        <div id="whats-new-banner" class="whats-new-banner">
+            <div class="whats-new-banner-body">
+                <span class="whats-new-banner-headline">BookBridge updated to {{ whats_new.version }}</span>
+                <a href="/whats-new" class="whats-new-banner-link">What's new</a>
+                {% if whats_new.action_items %}
+                <span class="whats-new-banner-sep">&middot;</span>
+                <span class="whats-new-banner-action"><strong>Action required:</strong> {{ whats_new.action_items | join(' · ') }}</span>
+                {% endif %}
+            </div>
+            <button type="button" class="whats-new-banner-close" onclick="dismissWhatsNewBanner()" aria-label="Dismiss">✕</button>
+        </div>
+        <script>
+            function dismissWhatsNewBanner() {
+                fetch('/whats-new/dismiss', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                }).catch(function (e) { console.debug('whats-new dismiss failed', e); });
+                var el = document.getElementById('whats-new-banner');
+                if (el) el.remove();
+            }
+        </script>
+        {% endif %}
         <!-- Forge Status Banner -->
         <div id="forge-status-banner" class="forge-banner" style="display: none;">
             <div style="display: flex; align-items: center; gap: 12px;">
