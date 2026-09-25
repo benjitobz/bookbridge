@@ -8,6 +8,12 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Added
 
+- **See what's new after an upgrade.** The first time you open the Library after
+  BookBridge is updated, a banner says which version you are now on, links to its
+  release notes and shows anything you need to do, such as updating the KOReader
+  plugin. Dismiss it, or open the notes, and it does not come back until the next
+  update. Every user sees it once; development builds don't show it.
+
 - **Read-along EPUBs for BookOrbit, built by BookBridge — no Storyteller needed.**
   BookBridge can now turn a matched audiobook and ebook into a read-along EPUB: the
   book with its narration built in, highlighting each sentence as it is read. It uses

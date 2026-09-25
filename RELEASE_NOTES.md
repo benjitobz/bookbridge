@@ -9,7 +9,16 @@ This release ships BridgeSync **0.9.6** for KOReader and fixes positions landing
 paragraph early, Storyteller snapping back to the audiobook position, and a CWA
 download that could fetch the wrong book.
 
+## Action Required
+
+- Re-download BridgeSync **0.9.6** on every KOReader device that uses the plugin,
+  then restart KOReader.
+
 ## What's New
+
+- **See what's new after an upgrade.** The first time you open the Library after an
+  update, a banner shows the new version, links to these notes and lists anything you
+  need to do. It appears once per update for every user.
 
 - **Read-along EPUBs for BookOrbit, built by BookBridge.** A matched audiobook and
   ebook can become a read-along EPUB: the book with its narration built in,
