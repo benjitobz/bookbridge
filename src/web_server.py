@@ -2028,10 +2028,6 @@ def get_kosync_id_for_ebook(ebook_filename, booklore_id=None, original_filename=
                          if str(res.get('id')) == cwa_id:
                              target = res
                              break
-                     
-                     # If no exact ID match, maybe it was the only result
-                     if not target and len(results) == 1:
-                         target = results[0]
 
                      # Priority 2: Use direct download URL from search if available
                      if target and target.get('download_url'):
@@ -2039,7 +2035,10 @@ def get_kosync_id_for_ebook(ebook_filename, booklore_id=None, original_filename=
                      else:
                          # Priority 3: Fallback to get_book_by_id only if search didn't provide a URL
                          # This may crash server on metadata page, but includes a blind URL fallback
-                         logger.debug(f"🔍 Search did not return a usable result, trying direct ID lookup")
+                         if results and not target:
+                             logger.info(f"🔍 CWA search for ID '{cwa_id}' returned {len(results)} result(s), none with that ID — looking it up by ID")
+                         else:
+                             logger.debug(f"🔍 Search did not return a usable result, trying direct ID lookup")
                          target = cwa_client.get_book_by_id(cwa_id)
 
                      if target and target.get('download_url'):

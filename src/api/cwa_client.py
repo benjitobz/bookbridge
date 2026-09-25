@@ -386,8 +386,6 @@ class CWAClient:
                         for res in results:
                             if str(res['id']) == str(cwa_id):
                                 return res
-                        if len(results) == 1:
-                            return results[0]
             except Exception as e:
                 logger.warning(f"⚠️ CWA ID lookup failed for '{url}': {e}", exc_info=True)
 
