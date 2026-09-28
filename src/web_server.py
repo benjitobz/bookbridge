@@ -40,6 +40,7 @@ from src.utils.user_config import SERVICE_ENABLE_KEYS
 
 from src.utils.config_loader import ConfigLoader, KNOWN_SETTING_KEYS, env_truthy
 from src.utils.cache_paths import safe_cache_path, safe_library_path, is_plain_basename
+from src.utils.ebook_utils import LINKABLE_EBOOK_EXTENSIONS, is_linkable_ebook_filename
 from src.utils.ebook_utils import LRUCache
 from src.utils.ebook_sources import is_grimmory_source, local_ebook_filename, normalize_ebook_source
 from src.utils.logging_utils import memory_log_handler, LOG_PATH
@@ -3098,12 +3099,13 @@ def _build_local_ebook_title_index():
     index = {}
     try:
         if EBOOK_DIR.exists():
-            for eb in EBOOK_DIR.glob("**/*.epub"):
-                stem = eb.stem
-                title_part = stem.split(" - ", 1)[0]
-                for key in (_ebook_title_key(title_part), _ebook_title_key(stem)):
-                    if key:
-                        index.setdefault(key, eb.name)
+            for extension in sorted(LINKABLE_EBOOK_EXTENSIONS):
+                for eb in EBOOK_DIR.glob(f"**/*{extension}"):
+                    stem = eb.stem
+                    title_part = stem.split(" - ", 1)[0]
+                    for key in (_ebook_title_key(title_part), _ebook_title_key(stem)):
+                        if key:
+                            index.setdefault(key, eb.name)
     except Exception as e:
         logger.warning(f"⚠️ Failed to build local ebook title index: {e}", exc_info=True)
     return index
@@ -3130,7 +3132,7 @@ def get_searchable_ebooks(search_term):
             if books:
                 for b in books:
                     fname = b.get('fileName', '')
-                    if fname.lower().endswith('.epub'):
+                    if is_linkable_ebook_filename(fname):
                         found_filenames.add(fname.lower())
                         found_stems.add(Path(fname).stem.lower())
                         results.append(EbookResult(
@@ -3163,7 +3165,7 @@ def get_searchable_ebooks(search_term):
                 fname = b.get('fileName') or ''
                 if not fname and local_index is not None:
                     fname = local_index.get(_ebook_title_key(b.get('title'))) or ''
-                if not fname.lower().endswith('.epub'):
+                if not is_linkable_ebook_filename(fname):
                     continue
                 if fname.lower() in found_filenames:
                     continue
@@ -3221,7 +3223,7 @@ def get_searchable_ebooks(search_term):
             )
             for book in kavita_books or []:
                 filename = book.get('fileName') or book.get('filename') or ''
-                if not filename.lower().endswith('.epub'):
+                if not is_linkable_ebook_filename(filename):
                     continue
                 if filename.lower() in found_filenames:
                     continue
@@ -3310,7 +3312,9 @@ def get_searchable_ebooks(search_term):
     # 4. Search filesystem (Local) - LOW PRIORITY
     if EBOOK_DIR.exists():
         try:
-            all_epubs = list(EBOOK_DIR.glob("**/*.epub"))
+            all_epubs = []
+            for extension in sorted(LINKABLE_EBOOK_EXTENSIONS):
+                all_epubs.extend(EBOOK_DIR.glob(f"**/*{extension}"))
             for eb in all_epubs:
                 fname_lower = eb.name.lower()
                 stem_lower = eb.stem.lower()

@@ -55,6 +55,7 @@ from src.utils.transcription_cancel import (
 from src.utils.transcriber import TranscriptionCancelled
 from src.utils.logging_utils import sanitize_log_data, get_persistent_condition_logger
 from src.utils.progress_metadata import state_metadata_kwargs
+from src.utils.ebook_utils import is_linkable_ebook_filename
 from src.utils.fixed_page_progress import coerce_page, is_cbz_book, is_cbz_filename
 from src.utils.ebook_sources import (
     is_grimmory_source,
@@ -2663,9 +2664,9 @@ class SyncManager:
                     bl_results = booklore_client.search_books(search_title)
                     logger.debug(f"Grimmory returned {len(bl_results)} results for '{search_title}'")
                     for b in bl_results:
-                         # Filter for EPUBs
+                         # Filter for linkable ebooks (EPUB + comics)
                          fname = b.get('fileName', '')
-                         if fname.lower().endswith('.epub'):
+                         if is_linkable_ebook_filename(fname):
                              found_filenames.add(fname)
                              matches.append({
                                  "source": "booklore",

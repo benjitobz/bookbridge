@@ -36,6 +36,18 @@ from src.utils.logging_utils import get_persistent_condition_logger
 
 logger = logging.getLogger(__name__)
 
+# Comic archive formats BookBridge can link and sync page-based progress for
+# (KOReader CBX support, Grimmory/BookOrbit CBX handling). Kept alongside the
+# canonical EPUB set so every search/scan path accepts the same filenames.
+COMIC_EBOOK_EXTENSIONS = frozenset({'.cbz', '.cbr', '.cbt', '.cb7'})
+LINKABLE_EBOOK_EXTENSIONS = frozenset({'.epub', *COMIC_EBOOK_EXTENSIONS})
+
+
+def is_linkable_ebook_filename(name):
+    """True for filenames BookBridge can link (EPUB plus comic archives)."""
+    return str(name or '').strip().lower().endswith(tuple(LINKABLE_EBOOK_EXTENSIONS))
+
+
 # Import epubcfi library for accurate CFI parsing
 import epubcfi
 
