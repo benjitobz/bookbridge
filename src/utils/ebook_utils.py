@@ -36,20 +36,26 @@ from src.utils.logging_utils import get_persistent_condition_logger
 
 logger = logging.getLogger(__name__)
 
-# Comic archive formats BookBridge can link and sync page-based progress for
-# (KOReader CBX support, Grimmory/BookOrbit CBX handling). Kept alongside the
-# canonical EPUB set so every search/scan path accepts the same filenames.
-COMIC_EBOOK_EXTENSIONS = frozenset({'.cbz', '.cbr', '.cbt', '.cb7'})
+# Import epubcfi library for accurate CFI parsing
+import epubcfi
+
+# Comic archives: '.cbz' only, matching is_cbz_filename() in fixed_page_progress.
+# The other CBX containers (.cbr/.cbt/.cb7) are invisible outside the Grimmory
+# client, and the zipfile-based page counter cannot open RAR/7z/tar archives,
+# so a linked .cbr would be sent to the EPUB parser and fail to sync.
+COMIC_EBOOK_EXTENSIONS = frozenset({'.cbz'})
 LINKABLE_EBOOK_EXTENSIONS = frozenset({'.epub', *COMIC_EBOOK_EXTENSIONS})
 
 
-def is_linkable_ebook_filename(name):
-    """True for filenames BookBridge can link (EPUB plus comic archives)."""
+def is_linkable_ebook_filename(name: str | None) -> bool:
+    """True for filenames BookBridge can link (EPUB plus CBZ comics)."""
     return str(name or '').strip().lower().endswith(tuple(LINKABLE_EBOOK_EXTENSIONS))
 
 
-# Import epubcfi library for accurate CFI parsing
-import epubcfi
+def is_comic_ebook_filename(name: str | None) -> bool:
+    """True for comic archive filenames (currently CBZ only)."""
+    return str(name or '').strip().lower().endswith(tuple(COMIC_EBOOK_EXTENSIONS))
+
 
 class LRUCache:
     def __init__(self, capacity: int = 3):

@@ -55,7 +55,7 @@ from src.utils.transcription_cancel import (
 from src.utils.transcriber import TranscriptionCancelled
 from src.utils.logging_utils import sanitize_log_data, get_persistent_condition_logger
 from src.utils.progress_metadata import state_metadata_kwargs
-from src.utils.ebook_utils import is_linkable_ebook_filename
+from src.utils.ebook_utils import LINKABLE_EBOOK_EXTENSIONS, is_linkable_ebook_filename
 from src.utils.fixed_page_progress import coerce_page, is_cbz_book, is_cbz_filename
 from src.utils.ebook_sources import (
     is_grimmory_source,
@@ -2684,17 +2684,19 @@ class SyncManager:
                 try:
                     clean_title = search_title.lower()
                     fs_matches = 0
-                    for epub in self.books_dir.rglob("*.epub"):
-                         if epub.name in found_filenames:
-                             continue
-                         if clean_title in epub.name.lower():
-                             fs_matches += 1
-                             matches.append({
-                                 "source": "filesystem",
-                                 "filename": epub.name,
-                                 "path": str(epub),
-                                 "confidence": "high"
-                             })
+                    for epub in self.books_dir.rglob('*'):
+                        if not epub.is_file() or epub.suffix.lower() not in LINKABLE_EBOOK_EXTENSIONS:
+                            continue
+                        if epub.name in found_filenames:
+                            continue
+                        if clean_title in epub.name.lower():
+                            fs_matches += 1
+                            matches.append({
+                                "source": "filesystem",
+                                "filename": epub.name,
+                                "path": str(epub),
+                                "confidence": "high"
+                            })
                     logger.debug(f"Filesystem found {fs_matches} matches")
                 except Exception as e:
                     logger.warning(f"⚠️ Filesystem search failed during suggestion: {e}", exc_info=True)
