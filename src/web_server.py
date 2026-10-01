@@ -1939,6 +1939,39 @@ def _reconcile_aligned_shelf():
         logger.warning("Aligned-shelf reconcile failed: %s", e, exc_info=True)
 
 
+_pending_jobs_thread = None
+_pending_jobs_lock = threading.Lock()
+
+
+def _check_pending_jobs_async():
+    """Run the transcription/alignment queue on its own worker.
+
+    check_pending_jobs processes each claimed job to completion, and one long
+    audiobook holds it for hours. Called straight from the scheduler that stalls
+    every other scheduled job -- the per-user sync, the session flush, the
+    hourly diagnostics -- for as long as the queue takes to drain, because
+    schedule.run_pending() is serial. Only one worker runs at a time: a tick
+    that finds the previous one still working is a no-op, which keeps the
+    one-job-at-a-time behaviour the queue had on the scheduler thread.
+    """
+    global _pending_jobs_thread
+    with _pending_jobs_lock:
+        if _pending_jobs_thread is not None and _pending_jobs_thread.is_alive():
+            return False
+
+        def runner():
+            try:
+                manager.check_pending_jobs()
+            except Exception as e:
+                logger.error(f"❌ Pending-jobs worker failed: {e}", exc_info=True)
+
+        _pending_jobs_thread = threading.Thread(
+            target=runner, daemon=True, name="pending-jobs"
+        )
+        _pending_jobs_thread.start()
+        return True
+
+
 def sync_daemon():
     """Background sync daemon running in a separate thread."""
     try:
@@ -1946,7 +1979,7 @@ def sync_daemon():
         # Use the global SYNC_PERIOD_MINS which is validated
         schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(manager.run_sync_for_all_users)
         schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_reconcile_shared_library)
-        schedule.every(1).minutes.do(manager.check_pending_jobs)
+        schedule.every(1).minutes.do(_check_pending_jobs_async)
         schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_reconcile_aligned_shelf)
         schedule.every(1).minutes.do(manager.flush_reading_sessions_for_all_users)
         schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_mirror_kosync_logins_from_grimmory)
