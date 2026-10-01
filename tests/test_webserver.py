@@ -1897,6 +1897,41 @@ class CleanFlaskIntegrationTest(unittest.TestCase):
             'const display_name = element.dataset.displayName || filename;', html
         )
 
+    def test_add_book_search_finds_quoted_and_plain_greene_shorts_editions(self):
+        """Both directions of the reported BookOrbit title mismatch reach the picker."""
+        import src.web_server as ws
+        from src.services.audio_source_adapters import AudioResult
+
+        plain = 'The Greene Shorts Incest Collection; Volume 1'
+        quoted = 'The "Greene Shorts" Incest Collection; Volume 1'
+        audio = AudioResult(source="BookOrbit", source_id="6149", title=plain)
+        ebooks = [
+            ws.EbookResult(name="The _Greene Shorts_ Incest Collection; Volume 1 (2011).epub",
+                           title=quoted, source="BookOrbit", source_id="6138"),
+            ws.EbookResult(name="The _Greene Shorts_ Incest Collection; Volume 2 (2013).epub",
+                           title='The "Greene Shorts" Incest Collection; Volume 2',
+                           source="BookOrbit", source_id="6139"),
+        ]
+
+        def audio_search(query):
+            return [audio] if query.lower() in plain.lower() else []
+
+        def ebook_search(query):
+            return [book for book in ebooks if query.lower() in book.title.lower()]
+
+        with patch.object(ws, "get_searchable_audiobooks", side_effect=audio_search), \
+             patch.object(ws, "get_searchable_ebooks", side_effect=ebook_search):
+            for title in (plain, quoted, 'The “Greene Shorts”Incest Collection'):
+                with self.subTest(title=title):
+                    response = self.client.get('/add-book', query_string={'search': title})
+                    html = response.get_data(as_text=True)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertIn('data-audio-title="The Greene Shorts Incest Collection; Volume 1"', html)
+                    self.assertEqual(html.count('data-audio-title="The Greene Shorts Incest Collection; Volume 1"'), 1)
+                    self.assertIn('data-source-id="6138"', html)
+                    if title != 'The “Greene Shorts”Incest Collection':
+                        self.assertNotIn('data-source-id="6139"', html)
+
     def test_add_book_cards_disambiguate_same_titled_series_books(self):
         """Three same-titled 'Sorcerer' books rendered as indistinguishable cards.
 

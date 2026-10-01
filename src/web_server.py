@@ -2906,7 +2906,7 @@ def get_searchable_audiobooks(search_term):
     try:
         clients = uc()
         if clients.abs_client and clients.abs_client.is_configured():
-            adapters["ABS"] = ABSAudioSourceAdapter(clients.abs_client)
+            adapters["ABS"] = ABSAudioSourceAdapter(clients.abs_client, container.data_dir())
         if clients.booklore_client and clients.booklore_client.is_configured():
             adapters["BookLore"] = BookLoreAudioSourceAdapter(clients.booklore_client, container.data_dir())
         _bo_client = getattr(clients, "bookorbit_client", None)
@@ -2945,13 +2945,27 @@ def get_searchable_audiobooks(search_term):
     return results
 
 
+def _punctuation_search_key(value):
+    """Compare title text without punctuation or whitespace."""
+    return ''.join(char.lower() for char in (value or '') if char.isalnum())
+
+
+def _punctuation_search_fragment(term):
+    """Return a short phrase shared by punctuated and plain long titles."""
+    if ' - ' in (term or ''):
+        return ''
+    words = re.findall(r'[^\W\d_]+', term or '')
+    if words and words[0].lower() in ('the', 'a', 'an'):
+        words = words[1:]
+    return ' '.join(words[:2]) if len(words) >= 4 else ''
+
+
 def _audiobook_search_variants(term):
     """Progressive query relaxations for a (possibly filename-derived) term.
 
-    Yields the raw term, then with the file extension and trailing edition/year
-    markers removed, then just the title before " - <author>". ABS title search
-    is strict, so reviewing a suggestion whose title is a filename stem
-    ("Title - Author (2026)") needs the bare title to match.
+    Yields the raw term, then removes filename suffixes and punctuation.
+    Long titles also get a short phrase so strict provider searches can find
+    editions that differ by punctuation within the title.
     """
     term = (term or "").strip()
     variants = []
@@ -2995,18 +3009,31 @@ def _audiobook_search_variants(term):
         _add_hyphen_space_variants(title_part)
     else:
         _add_hyphen_space_variants(no_edition)
+    search_title = no_edition.split(' - ')[0]
+    _add(' '.join(re.findall(r'\w+', search_title)))
+    if ' - ' not in no_edition:
+        _add(_punctuation_search_fragment(search_title))
     return variants
 
 
 def _search_audiobooks_with_fallback(term):
-    """Search audiobooks, relaxing a filename-style term until something matches."""
+    """Merge audiobook hits across title spellings and source catalogs."""
     results = []
+    seen = set()
+    fragment = _punctuation_search_fragment(term)
+    query_key = _punctuation_search_key(term)
     for index, variant in enumerate(_audiobook_search_variants(term)):
-        results = get_searchable_audiobooks(variant)
-        if results:
-            if index > 0:
-                logger.debug("Audiobook search matched on relaxed term %r (from %r)", variant, term)
-            break
+        for result in get_searchable_audiobooks(variant):
+            if (fragment and variant == fragment and variant != term
+                    and query_key not in _punctuation_search_key(result.title)):
+                continue
+            key = (result.source, result.source_id)
+            if key not in seen:
+                seen.add(key)
+                results.append(result)
+                if index > 0:
+                    logger.debug("Audiobook search matched on relaxed term %r (from %r)", variant, term)
+    results.sort(key=lambda item: (item.title or item.display_name or '').lower())
     return results
 
 
@@ -3026,8 +3053,14 @@ def _search_ebooks_with_fallback(term):
     """
     by_name = {}
     order = []
+    fragment = _punctuation_search_fragment(term)
+    query_key = _punctuation_search_key(term)
     for variant in _audiobook_search_variants(term):
         for ebook in get_searchable_ebooks(variant):
+            if (fragment and variant == fragment and variant != term
+                    and query_key not in _punctuation_search_key(
+                        getattr(ebook, 'title', None) or ebook.name)):
+                continue
             key = (getattr(ebook, "name", "") or "").lower()
             if not key:
                 continue
@@ -4099,6 +4132,7 @@ def settings():
             'BOOKORBIT_ENABLED',
             'BOOKORBIT_READING_SESSIONS',
             'BOOKORBIT_SHELF_WATCH_ENABLED',
+            'BOOKORBIT_READING_WATCH_ENABLED',
             'KAVITA_ENABLED',
             'KAVITA_SHELF_WATCH_ENABLED',
             'CALIBRE_USE_ABS_IDENTIFIER',
@@ -4120,6 +4154,7 @@ def settings():
             'CONTENT_MATCH_GUARD',
             'SHARE_ALL_BOOKS_WITH_ALL_USERS',
             'REMOTE_AUTH_ENABLED',
+            'SERIES_SHOW_CURRENT_BOOK_DETAIL',
         ]
 
         # Current settings in DB
@@ -4359,6 +4394,36 @@ def _finalize_series_group(group: dict) -> None:
     next_book = children[next_index] if next_index is not None else None
     preview_books, preview_hidden_count = _series_preview_books(children, next_index)
 
+    # Single-card series design (issue #449): which child leads the collapsed
+    # card. An in-progress child wins over an unstarted one -- readers care
+    # about where they actually are, not just the next unread volume -- and
+    # among several in-progress children the most recently synced one wins,
+    # ties broken toward the earlier one in series order (children is already
+    # sequence-sorted, and max() keeps the first maximal element).
+    in_progress_indexed = [
+        (i, c) for i, c in enumerate(children) if 0 < (c.get("unified_progress") or 0) < 100
+    ]
+    if in_progress_indexed:
+        lead_index, lead_book = max(in_progress_indexed, key=lambda pair: pair[1].get("last_sync_unix") or 0.0)
+    elif next_book is not None:
+        lead_index, lead_book = next_index, next_book
+    else:
+        lead_index, lead_book = None, None
+
+    if lead_book is not None:
+        other_children = [c for i, c in enumerate(children) if i != lead_index]
+        other_next_index = next(
+            (i for i, c in enumerate(other_children) if (c.get("unified_progress") or 0) < 100),
+            None,
+        )
+        other_preview_books, other_preview_hidden_count = _series_preview_books(
+            other_children, other_next_index
+        )
+    else:
+        other_children = []
+        other_preview_books = []
+        other_preview_hidden_count = 0
+
     last_sync_unix = 0.0
     for c in children:
         ts = c.get("last_sync_unix") or 0.0
@@ -4387,6 +4452,10 @@ def _finalize_series_group(group: dict) -> None:
         "next_book": next_book,
         "preview_books": preview_books,
         "preview_hidden_count": preview_hidden_count,
+        "lead_book": lead_book,
+        "other_children": other_children,
+        "other_preview_books": other_preview_books,
+        "other_preview_hidden_count": other_preview_hidden_count,
         "last_sync_unix": last_sync_unix,
         "added_at_unix": added_at_unix,
         "stack_cover_urls": [c.get("cover_url") for c in children[:3] if c.get("cover_url")],

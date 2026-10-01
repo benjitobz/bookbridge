@@ -704,10 +704,21 @@ class StorygraphClient:
 
         clamped_percent = max(0, min(100, int(round((percentage or 0) * 100 if percentage <= 1 else percentage))))
         book_num_of_pages = self._extract_book_num_of_pages(page.text)
+        progress_type = "percentage"
+        progress_number = clamped_percent
+        try:
+            total_pages = int(book_num_of_pages)
+        except (TypeError, ValueError):
+            total_pages = 0
+        if total_pages > 0:
+            # The source position has no print-page map; this page is estimated.
+            fraction = percentage if percentage <= 1 else percentage / 100
+            progress_type = "pages"
+            progress_number = max(0, min(total_pages, round(fraction * total_pages)))
 
         payload = {
-            "read_status[progress_number]": str(clamped_percent),
-            "read_status[progress_type]": "percentage",
+            "read_status[progress_number]": str(progress_number),
+            "read_status[progress_type]": progress_type,
             "read_status[book_num_of_pages]": str(book_num_of_pages),
             "book_id": book_id,
             "on_book_page": "true",

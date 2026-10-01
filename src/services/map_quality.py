@@ -15,6 +15,7 @@ import bisect
 import json
 import math
 import re
+import unicodedata
 from dataclasses import dataclass
 from statistics import median
 from typing import Dict, List, Optional, Tuple
@@ -574,7 +575,13 @@ def detect_out_of_order_blocks(anchors: List[Dict], kept: List[Dict],
 # no-op on any install without Ollama, which let eight mismatched audio/ebook pairings
 # on the live install get stored as maps that synced garbage positions silently.
 #
-# Tokenization: lowercase `[a-z0-9']+` word tokens.
+# Tokenization: casefolded runs of letters, digits and apostrophes in any script
+# (issue #460: the original `[a-z0-9']+` saw only digits and markup remnants in a
+# Cyrillic book, scoring correct Russian pairings at 3-7%). Combining marks are
+# stripped and word-internal curly apostrophes straightened, so an accent, `ё`/`е`, or `’`/`'`
+# difference between the ebook and the ASR output doesn't split a match. For
+# ASCII text the tokens are identical to the original pattern, so the
+# calibration below still holds unchanged.
 #
 # CALIBRATION -- measured by running THIS function (samples=200, ngram=6) over 28
 # real book/transcript pairs on the live library. These are its actual return
@@ -603,16 +610,31 @@ def detect_out_of_order_blocks(anchors: List[Dict], kept: List[Dict],
 # Do not raise it toward the healthy floor without re-running that sweep -- at 0.25
 # the margin under Push is only 0.05, one bad transcript away from a false refusal.
 
-# Below this many tokens on either side, there are too few n-grams to sample
-# meaningfully -- return 1.0 ("cannot judge, do not block") rather than a noisy score.
+# Below this many letter-bearing tokens on either side, there are too few n-grams
+# to sample meaningfully -- return 1.0 ("cannot judge, do not block") rather than a
+# noisy score. Digit-only tokens (page numbers, years) don't count: a text whose
+# words the tokenizer can't see would otherwise be scored on those alone.
 _MIN_TOKENS_FOR_OVERLAP = 50
 
-_WORD_TOKEN_RE = re.compile(r"[a-z0-9']+")
+_WORD_TOKEN_RE = re.compile(r"(?:[^\W_]|')+")
+_LETTER_RE = re.compile(r"[^\W\d_]")
+# Only a word-internal `’` is an apostrophe ("don’t"); at a word edge it is a
+# closing single quote (‘Hello,’) and must stay a separator, as it always was.
+_INNER_CURLY_APOSTROPHE_RE = re.compile(r"(?<=\w)’(?=\w)")
+
+# Scripts written without spaces between words (Han, kana, Thai, Lao, Khmer,
+# Myanmar). A word tokenizer returns whole phrases for them, and ASR punctuates
+# phrases differently from the book, so n-grams would never line up. With no
+# calibration data for these scripts the overlap cannot judge them.
+_UNSPACED_SCRIPT_RE = re.compile(
+    "[฀-໿က-႟ក-៿぀-ヿㇰ-ㇿ"
+    "㐀-䶿一-鿿豈-﫿ｦ-ﾝ\U00020000-\U0002ffff]"
+)
+_UNSPACED_SCRIPT_MAX_FRACTION = 0.5
 
 
 def _word_tokens(text: str) -> List[str]:
-    """Lowercase word tokens, matching the probe scripts behind the calibration
-    table above.
+    """Casefolded word tokens in any script (see the tokenization note above).
 
     Strips ``INLINE_TEXT_JOINER`` first: ``_WORD_TOKEN_RE`` doesn't include it,
     so left in place it would split a bionic-reading mid-word join (e.g.
@@ -620,7 +642,25 @@ def _word_tokens(text: str) -> List[str]:
     thing the joiner exists to prevent for word-level comparisons like
     :func:`transcript_text_overlap`.
     """
-    return _WORD_TOKEN_RE.findall(strip_inline_joiner((text or "").lower()))
+    folded = strip_inline_joiner(text or "").casefold()
+    if not folded.isascii():
+        folded = unicodedata.normalize("NFD", _INNER_CURLY_APOSTROPHE_RE.sub("'", folded))
+        folded = "".join(ch for ch in folded if unicodedata.category(ch) != "Mn")
+    return _WORD_TOKEN_RE.findall(folded)
+
+
+def _letter_token_count(tokens: List[str]) -> int:
+    """Number of tokens containing at least one letter."""
+    return sum(1 for token in tokens if _LETTER_RE.search(token))
+
+
+def _mostly_unspaced_script(tokens: List[str]) -> bool:
+    """True when most token characters belong to a script written without spaces."""
+    joined = "".join(tokens)
+    if not joined or joined.isascii():
+        return False
+    unspaced = len(_UNSPACED_SCRIPT_RE.findall(joined))
+    return unspaced / len(joined) > _UNSPACED_SCRIPT_MAX_FRACTION
 
 
 def transcript_text_overlap(transcript_text: str, ebook_text: str,
@@ -634,13 +674,16 @@ def transcript_text_overlap(transcript_text: str, ebook_text: str,
     matched / sampled.
 
     Returns 1.0 (cannot judge, do not block) when either side has fewer than
-    `_MIN_TOKENS_FOR_OVERLAP` tokens.
+    `_MIN_TOKENS_FOR_OVERLAP` letter-bearing tokens, or is mostly written in a
+    script without spaces between words.
     """
     transcript_tokens = _word_tokens(transcript_text)
     ebook_tokens = _word_tokens(ebook_text)
-    if (len(transcript_tokens) < _MIN_TOKENS_FOR_OVERLAP
-            or len(ebook_tokens) < _MIN_TOKENS_FOR_OVERLAP
+    if (_letter_token_count(transcript_tokens) < _MIN_TOKENS_FOR_OVERLAP
+            or _letter_token_count(ebook_tokens) < _MIN_TOKENS_FOR_OVERLAP
             or len(transcript_tokens) < ngram or len(ebook_tokens) < ngram):
+        return 1.0
+    if _mostly_unspaced_script(transcript_tokens) or _mostly_unspaced_script(ebook_tokens):
         return 1.0
 
     transcript_ngrams = {

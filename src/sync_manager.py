@@ -1533,7 +1533,7 @@ class SyncManager:
         adapters = {}
         abs_client = getattr(bundle, "abs_client", None)
         if abs_client is not None:
-            adapters["ABS"] = ABSAudioSourceAdapter(abs_client)
+            adapters["ABS"] = ABSAudioSourceAdapter(abs_client, self.data_dir or Path("/data"))
 
         booklore_client = getattr(bundle, "booklore_client", None)
         if booklore_client is not None:

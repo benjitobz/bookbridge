@@ -3,7 +3,7 @@ import json
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import requests
 
@@ -121,6 +121,33 @@ class TestKoSyncClientBasicAuth(unittest.TestCase):
             result = self.client.get_progress_with_metadata("startup-doc")
 
         self.assertEqual(result, (None, None, {}))
+
+
+class TestKoSyncClientBuiltinDefault(unittest.TestCase):
+    def test_empty_server_writes_to_builtin_port(self) -> None:
+        for port, expected_port in (("", 5757), ("5758", 5758)):
+            with self.subTest(port=port), patch.dict(
+                "os.environ",
+                {
+                    "KOSYNC_ENABLED": "true",
+                    "KOSYNC_SERVER": "",
+                    "KOSYNC_PORT": port,
+                },
+            ):
+                client = KoSyncClient(credentials={
+                    "KOSYNC_USER": "reader",
+                    "KOSYNC_KEY": "password",
+                })
+                with patch.object(
+                    client.session, "put", return_value=Mock(status_code=200)
+                ) as put:
+                    self.assertTrue(client.is_configured())
+                    self.assertTrue(client.update_progress("doc-1", 0.3, "/body/p.0"))
+
+                self.assertEqual(
+                    put.call_args.args[0],
+                    f"http://127.0.0.1:{expected_port}/syncs/progress",
+                )
 
 
 if __name__ == "__main__":
