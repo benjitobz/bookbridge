@@ -88,6 +88,8 @@ def _manifest_signature(book) -> tuple:
 # Use 500 to stay well under the cap with room for other query parameters.
 _SQL_IN_CHUNK = 500
 
+_PENDING_SHELF_ADDS_KEY = "BOOKLORE_SHELF_PENDING_ADDS"
+
 
 class DatabaseService:
     """
@@ -105,6 +107,7 @@ class DatabaseService:
         self._default_uid = None  # cached default (admin) user id for state scoping
         self._catalog_change_callbacks: list[Callable[[], None]] = []
         self._ebook_source_claim_lock = threading.Lock()
+        self._pending_shelf_adds_lock = threading.Lock()
 
         # Run Alembic migrations to ensure schema is up to date
         self._run_alembic_migrations()
@@ -297,6 +300,37 @@ class DatabaseService:
                 session.delete(setting)
                 return True
             return False
+
+    def get_pending_shelf_adds(self) -> list[tuple[str, Optional[int]]]:
+        """Grimmory shelf adds deferred until alignment, as (abs_id, user_id) pairs.
+
+        ``user_id`` is the reader whose login and shelf the add belongs to; None
+        is the global login.
+        """
+        return [
+            (abs_id, user_id)
+            for abs_id, user_id in self.get_json_setting(_PENDING_SHELF_ADDS_KEY, default=[])
+        ]
+
+    def add_pending_shelf_add(self, abs_id: str, user_id: Optional[int]) -> None:
+        """Defer a book's Grimmory shelf add for ``user_id`` until it is aligned."""
+        with self._pending_shelf_adds_lock:
+            pending = self.get_pending_shelf_adds()
+            if (abs_id, user_id) not in pending:
+                self.set_json_setting(_PENDING_SHELF_ADDS_KEY, pending + [(abs_id, user_id)])
+
+    def remove_pending_shelf_adds(
+        self, abs_id: str, user_id: Optional[int] = None, all_users: bool = False
+    ) -> None:
+        """Forget a book's deferred Grimmory shelf add for one user, or for every user."""
+        with self._pending_shelf_adds_lock:
+            pending = self.get_pending_shelf_adds()
+            kept = [
+                entry for entry in pending
+                if entry[0] != abs_id or not (all_users or entry[1] == user_id)
+            ]
+            if len(kept) != len(pending):
+                self.set_json_setting(_PENDING_SHELF_ADDS_KEY, kept)
 
     # ------------------------------------------------------------------
     # Users (multi-user)
