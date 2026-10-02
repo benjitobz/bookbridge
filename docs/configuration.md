@@ -241,6 +241,8 @@ Grimmory is a supported ebook and audiobook source. You can use it for ebook syn
 | Username | `BOOKLORE_USER` | empty | Grimmory username. |
 | Password | `BOOKLORE_PASSWORD` | empty | Grimmory password. |
 | Shelf Name | `BOOKLORE_SHELF_NAME` | `Kobo` | Shelf used for matched ebooks. |
+| Shelve Only When Aligned | `BOOKLORE_SHELF_REQUIRE_ALIGNMENT` | `false` | Global. A matched book joins the shelf only once BookBridge holds an alignment map for it, checked every sync cycle. |
+| Shelf Owner | `BOOKLORE_SHELF_OWNER` | empty | Global, used with Shelve Only When Aligned. The BookBridge user whose own Grimmory login adds aligned books to the shelf and removes a book when its match is deleted; use the account that owns the shelf in Grimmory. Empty uses the global Grimmory login. |
 | Library ID | `BOOKLORE_LIBRARY_ID` | empty | Optional library restriction. |
 | Record Reading Sessions | `GRIMMORY_READING_SESSIONS` | `true` | Sends reading or listening session updates back to Grimmory. |
 | Highlight Sync | `BOOKLORE_ANNOTATION_SYNC` | `false` | Enables Grimmory web-reader highlight/note relay for this reader. Requires the current Bridge Sync plugin for KOReader device annotations. |
