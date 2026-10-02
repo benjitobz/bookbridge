@@ -150,6 +150,7 @@ class TestDeletedMatchLeavesTheShelf(RequireAlignmentTestCase):
         deleter = MagicMock()
         with patch.object(web_server, "uc", return_value=deleter), \
                 patch.object(web_server, "DATA_DIR", data_dir, create=True), \
+                patch.object(web_server, "manager", None), \
                 patch("src.services.shelf_watch_service.clear_shelf_watch_throttle"):
             web_server.cleanup_mapping_resources(book)
         return deleter.booklore_client
