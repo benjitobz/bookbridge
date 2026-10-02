@@ -781,6 +781,15 @@
                             (including your own). The server URL and engine settings here stay global.
                         </div>
                     </div>
+                    <div class="checkbox-wrapper full-width">
+                        <input type="checkbox" id="abs_collection_reconcile" name="ABS_COLLECTION_RECONCILE"
+                            {% if get_bool('ABS_COLLECTION_RECONCILE') %}checked{% endif %}>
+                        <label for="abs_collection_reconcile">Keep every match in its auto-add collection</label>
+                        <small>Every sync cycle, any matched audiobook missing from its owner's auto-add collection
+                            is added again, so an add that failed when the book was matched is not lost. With several
+                            audiobook libraries, a collection of that name is kept in each one. While this is on, a
+                            book removed from the collection by hand is added back.</small>
+                    </div>
 
                     <div class="form-group">
                         <label>Progress Offset (Seconds)</label>
