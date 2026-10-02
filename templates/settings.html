@@ -1036,8 +1036,17 @@
                         <label for="booklore_shelf_require_alignment">Add matched books to the shelf only once they are aligned</label>
                         <small>Normally a book joins the shelf the moment it is matched. With this on it waits until
                             BookBridge has built the alignment map, so the shelf only ever lists books whose
-                            audio&harr;text sync is precise. Checked every sync cycle using the global Grimmory
-                            login; books are never removed by this.</small>
+                            audio&harr;text sync is precise. Checked every sync cycle using the Shelf Owner's
+                            Grimmory login (below), or the global one; the check never removes books.</small>
+                    </div>
+                    <div class="form-group full-width">
+                        <label>Shelf Owner</label>
+                        <input type="text" name="BOOKLORE_SHELF_OWNER"
+                            value="{{ get_val('BOOKLORE_SHELF_OWNER', '') }}" placeholder="BookBridge username">
+                        <div class="help-text">With the option above on, the BookBridge user whose own Grimmory login
+                            adds aligned books to the shelf and takes a book off it when its match is deleted. Name the
+                            account that owns the shelf in Grimmory. Blank: the global Grimmory login adds, and the
+                            person deleting a match removes it from their own shelf.</div>
                     </div>
 
                     <!-- Separator -->
