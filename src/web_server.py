@@ -1841,6 +1841,7 @@ def sync_daemon():
         schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_reconcile_shared_library)
         schedule.every(1).minutes.do(_suggestions_auto_scan_tick)
         schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_mirror_kosync_logins_from_grimmory)
+        schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_reconcile_abs_collection)
 
         logger.info(f"🔄 Sync daemon started (period: {SYNC_PERIOD_MINS} minutes)")
 
@@ -1859,6 +1860,7 @@ def sync_daemon():
             pass
 
         _mirror_kosync_logins_from_grimmory()
+        _reconcile_abs_collection()
 
         # Main daemon loop
         while True:
@@ -1924,6 +1926,50 @@ def _mirror_kosync_logins_from_grimmory():
         except Exception as e:
             logger.warning("KoSync login mirror failed for user %s: %s", user.id, e)
     return updated
+
+
+def _is_abs_audio_book(book):
+    if (book.sync_mode or '') == 'ebook_only':
+        return False
+    if (book.audio_source or 'ABS').strip().lower() != 'abs':
+        return False
+    return not str(book.abs_id).startswith(('booklore:', 'bookorbit:', 'ebook-'))
+
+
+def _reconcile_abs_collection():
+    if not env_truthy('ABS_COLLECTION_RECONCILE') or database_service is None:
+        return
+    try:
+        default_owner = database_service._default_user_id()
+        by_owner = {}
+        for book in database_service.get_books_by_status('active'):
+            if _is_abs_audio_book(book):
+                by_owner.setdefault(book.user_id or default_owner, []).append(book)
+        registry = container.user_client_registry()
+        added = 0
+        for owner, books in by_owner.items():
+            if owner is None:
+                continue
+            client = registry.get_clients(owner).abs_client
+            if client is None or not client.is_configured():
+                continue
+            creds = database_service.get_user_credentials(owner) or {}
+            collection = (creds.get('ABS_COLLECTION_NAME') or os.environ.get('ABS_COLLECTION_NAME')
+                          or 'Synced with KOReader').strip()
+            present = client.list_collection_item_ids(collection)
+            if present is None:
+                continue
+            for book in books:
+                if book.abs_id in present:
+                    continue
+                if client.add_to_collection(book.abs_id, collection):
+                    present.add(book.abs_id)
+                    added += 1
+        if added:
+            logger.info("🏷️ ABS collection reconcile added %d matched audiobook(s)", added)
+        return added
+    except Exception as e:
+        logger.warning("ABS collection reconcile failed: %s", e, exc_info=True)
 
 
 # ---------------- ORIGINAL ABS-KOSYNC HELPERS ----------------
@@ -4166,6 +4212,7 @@ def settings():
             'SUGGESTIONS_ENABLED',
             'SUGGESTIONS_AUTO_MATCH_ENABLED',
             'ABS_ONLY_SEARCH_IN_ABS_LIBRARY_ID',
+            'ABS_COLLECTION_RECONCILE',
             'REPROCESS_ON_CLEAR_IF_NO_ALIGNMENT',
             'INSTANT_SYNC_ENABLED',
             'STORYTELLER_POLL_WAIT_FOR_SETTLE',
