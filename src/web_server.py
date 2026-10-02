@@ -1897,32 +1897,60 @@ def _mirror_kosync_logins_from_grimmory():
     return updated
 
 
+def _grimmory_book_id(book):
+    source = str(getattr(book, 'ebook_source', '') or '').strip().lower()
+    source_id = getattr(book, 'ebook_source_id', None)
+    return str(source_id) if source in ('booklore', 'grimmory') and source_id else None
+
+
+_shelf_owner_warned = None
+
+
+def _sync_shelf_owner():
+    return (os.environ.get('BOOKLORE_SHELF_OWNER') or '').strip()
+
+
+def _sync_shelf_client():
+    """The Grimmory client that manages the aligned sync shelf: the own login of
+    the BookBridge user named in BOOKLORE_SHELF_OWNER, else the global login.
+    None when the named owner is not an active BookBridge user."""
+    global _shelf_owner_warned
+    owner = _sync_shelf_owner()
+    if not owner:
+        return _global_clients.booklore_client
+    user = database_service.get_user_by_username(owner) if database_service is not None else None
+    if user is None or not getattr(user, 'active', 0):
+        if _shelf_owner_warned != owner:
+            logger.warning("⚠️ Grimmory shelf owner '%s' is not an active BookBridge user",
+                           sanitize_log_data(owner))
+            _shelf_owner_warned = owner
+        return None
+    return container.user_client_registry().get_clients(user.id).booklore_client
+
+
 def _reconcile_aligned_shelf():
     """Put every aligned Grimmory match on the sync shelf.
 
     With BOOKLORE_SHELF_REQUIRE_ALIGNMENT on, a match is not shelved when it is
     made but here, once BookBridge holds an alignment map for it, so the shelf
-    lists only books whose audio<->text sync is precise. Uses the global
-    (primary admin) Grimmory login, the shelf's owner. Add-only: it never removes.
+    lists only books whose audio<->text sync is precise. Uses the shelf owner's
+    Grimmory login (see _sync_shelf_client). Add-only: it never removes.
     """
     if not env_truthy('BOOKLORE_SHELF_REQUIRE_ALIGNMENT'):
         return
     if database_service is None:
         return
     try:
-        client = _global_clients.booklore_client
+        client = _sync_shelf_client()
         if client is None or not client.is_configured():
             return
         shelf = (os.environ.get('BOOKLORE_SHELF_NAME') or 'Kobo').strip()
         books = database_service.get_books_by_status('active')
         aligned = {}
         for book in books:
-            source = str(getattr(book, 'ebook_source', '') or '').strip().lower()
-            source_id = getattr(book, 'ebook_source_id', None)
-            if source not in ('booklore', 'grimmory') or not source_id:
-                continue
-            if database_service.has_alignment(book.abs_id):
-                aligned[str(source_id)] = book
+            book_id = _grimmory_book_id(book)
+            if book_id and database_service.has_alignment(book.abs_id):
+                aligned[book_id] = book
         if not aligned:
             return
         on_shelf = {str(item.get('id')) for item in (client.list_books_on_shelf(shelf) or []) if isinstance(item, dict)}
@@ -9269,6 +9297,12 @@ def cleanup_mapping_resources(book, defer_audio_cache: bool = False):
                         client.remove_book_id_from_shelf(ebook_source_id, shelf_name)
                     else:
                         client.remove_from_shelf(shelf_filename, shelf_name)
+            elif env_truthy('BOOKLORE_SHELF_REQUIRE_ALIGNMENT') and _sync_shelf_owner():
+                client = _sync_shelf_client()
+                book_id = _grimmory_book_id(book)
+                if client is not None and client.is_configured() and book_id:
+                    shelf_name = (os.environ.get('BOOKLORE_SHELF_NAME') or 'Kobo').strip()
+                    client.remove_book_id_from_shelf(book_id, shelf_name)
             else:
                 client = clients.booklore_client
                 if client.is_configured():
