@@ -4,6 +4,19 @@
 
 All notable changes to BookBridge will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- BookFusion duplicate uploads now accept author objects as well as strings while
+  preserving exact title and author matching.
+- Ebook lookup continues through other libraries when a directory disappears or
+  a cached path encounters a stale filesystem handle.
+- KoSync discovery skips unavailable document hashes and continues scanning for
+  a valid match without attempting to persist a null hash.
+- Concurrent credential saves preserve encryption and user isolation, and
+  Grimmory cache updates recover when a competing operation removes the row.
+
 ## [7.9.0] - 2026-10-05
 
 ### Added
