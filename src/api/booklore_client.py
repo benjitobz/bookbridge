@@ -3004,6 +3004,20 @@ class BookloreClient:
             logger.debug("Grimmory: Reading session error for book %s: %s", book_id, e)
             return False
 
+    def get_koreader_sync_login(self) -> Optional[tuple[str, str]]:
+        """Return this account's KOReader sync username and plaintext password, or None if it has none."""
+        response = self._make_request("GET", "/api/v1/koreader-users/me")
+        if not response or response.status_code != 200:
+            return None
+        payload = self._parse_json_response(response, "Grimmory KOReader sync login")
+        if not isinstance(payload, dict):
+            return None
+        username = str(payload.get("username") or "").strip()
+        password = str(payload.get("password") or "")
+        if not username or not password:
+            return None
+        return username, password
+
     def get_all_shelves(self) -> list[dict]:
         """Fetch all regular shelves from Grimmory."""
         response = self._make_request("GET", "/api/v1/shelves")
