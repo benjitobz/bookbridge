@@ -23,6 +23,8 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- CWA search and UUID lookup tolerate bare HTML line breaks in Calibre-Web's
+  XHTML review content while retaining strict metadata and XML security checks (#477).
 - Malformed shelf membership and filter data no longer appears as a valid empty
   device manifest (#464).
 - Directory links under a mounted library can no longer expose files outside the
