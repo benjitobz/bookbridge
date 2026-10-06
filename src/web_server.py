@@ -34,7 +34,7 @@ from src.utils.user_context import (
     set_current_user_credentials, reset_current_user_credentials,
     get_current_user_credentials, get_current_user_id,
 )
-from src.utils.user_config import user_setting
+from src.utils.user_config import resolve_setting, user_setting
 from src.utils.user_config import global_fallback_allowed as _global_fallback_allowed
 from src.utils.user_config import SERVICE_ENABLE_KEYS
 from src.utils.user_config import resolve_setting
@@ -1861,6 +1861,7 @@ def sync_daemon():
         schedule.every(1).minutes.do(manager.flush_reading_sessions_for_all_users)
         schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_reconcile_aligned_shelf)
         schedule.every(1).hours.do(_run_diagnostics_send)
+        schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_reconcile_abs_collection)
 
         logger.info(f"🔄 Sync daemon started (period: {SYNC_PERIOD_MINS} minutes)")
 
@@ -1878,6 +1879,8 @@ def sync_daemon():
         except Exception:
             pass
 
+        _reconcile_abs_collection()
+
         # Main daemon loop
         while True:
             try:
@@ -1890,6 +1893,67 @@ def sync_daemon():
 
     except Exception as e:
         logger.error(f"❌ Sync daemon crashed: {e}", exc_info=True)
+
+
+def _is_abs_audio_book(book):
+    if (book.sync_mode or '') == 'ebook_only':
+        return False
+    if (book.audio_source or 'ABS').strip().lower() != 'abs':
+        return False
+    return not str(book.abs_id).startswith(('booklore:', 'bookorbit:', 'ebook-'))
+
+
+def _reconcile_abs_collection():
+    if not env_truthy('ABS_COLLECTION_RECONCILE') or database_service is None:
+        return
+    conditions = get_persistent_condition_logger()
+    try:
+        default_owner = database_service._default_user_id()
+        by_owner = {}
+        for book in database_service.get_books_by_status('active'):
+            if _is_abs_audio_book(book):
+                by_owner.setdefault(book.user_id or default_owner, []).append(book.abs_id)
+        registry = container.user_client_registry()
+    except Exception as e:
+        conditions.warn(
+            logger, "abs_collection_reconcile", "ABS collection reconcile failed: %s", e, exc_info=True,
+        )
+        return
+    conditions.resolve(logger, "abs_collection_reconcile", "ABS collection reconcile resumed")
+    added = 0
+    for owner, item_ids in by_owner.items():
+        if owner is None:
+            continue
+        try:
+            bundle = registry.get_clients(owner)
+            if not bundle.abs_client.is_configured():
+                continue
+            collection = resolve_setting(bundle.credentials, "ABS_COLLECTION_NAME", "Synced with KOReader")
+            count, refused = bundle.abs_client.add_missing_to_collection(item_ids, collection)
+        except Exception as e:
+            conditions.warn(
+                logger, f"abs_collection_reconcile:{owner}",
+                "ABS collection reconcile failed for user %s: %s", owner, e, exc_info=True,
+            )
+            continue
+        conditions.resolve(
+            logger, f"abs_collection_reconcile:{owner}", "ABS collection reconcile resumed for user %s", owner,
+        )
+        added += count
+        refused_key = f"abs_collection_refused:{owner}:{collection}"
+        if refused:
+            conditions.warn(
+                logger, refused_key,
+                "ABS collection '%s' of user %s is missing %d matched audiobook(s) that could not be added: %s",
+                collection, owner, len(refused), refused[0],
+            )
+        else:
+            conditions.resolve(
+                logger, refused_key, "ABS collection '%s' of user %s is complete again", collection, owner,
+            )
+    if added:
+        logger.info("🏷️ ABS collection reconcile added %d matched audiobook(s)", added)
+    return added
 
 
 # ---------------- ORIGINAL ABS-KOSYNC HELPERS ----------------
@@ -4207,6 +4271,7 @@ def settings():
             'SUGGESTIONS_ENABLED',
             'SUGGESTIONS_AUTO_MATCH_ENABLED',
             'ABS_ONLY_SEARCH_IN_ABS_LIBRARY_ID',
+            'ABS_COLLECTION_RECONCILE',
             'REPROCESS_ON_CLEAR_IF_NO_ALIGNMENT',
             'INSTANT_SYNC_ENABLED',
             'STORYTELLER_POLL_WAIT_FOR_SETTLE',
