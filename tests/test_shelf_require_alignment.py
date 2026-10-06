@@ -141,6 +141,17 @@ class TestPendingShelfAdds:
         db.remove_pending_shelf_adds("a1", all_users=True)
         assert db.get_pending_shelf_adds() == [("a2", READER)]
 
+    def test_successful_assignment_survives_a_restart(self, db, tmp_path):
+        db.record_shelf_assignment("a1", READER, 12, "Shared", "grimmory-45")
+        reopened = DatabaseService(str(tmp_path / "database.db"))
+        try:
+            assert reopened.get_shelf_assignments("a1") == [{
+                "abs_id": "a1", "reader_id": READER,
+                "target_user_id": 12, "shelf_name": "Shared", "source_id": "grimmory-45",
+            }]
+        finally:
+            reopened.db_manager.close()
+
 
 class TestMatchTimeShelving:
     def test_aligned_only_defers_the_add_and_still_clears_up_next(self, required):
@@ -457,6 +468,69 @@ class TestReconcile:
 
 
 class TestDeletedMatchLeavesTheShelf:
+    def test_aligned_add_is_removed_from_recorded_owner_after_settings_change(
+            self, required, tmp_path, monkeypatch):
+        book = required.book(align_method="lexical")
+        reader, reader_client = required.user("reader", shelf_name="Reader shelf")
+        owner, owner_client = required.owner()
+        required.db.add_pending_shelf_add("a1", reader)
+
+        assert web_server._reconcile_aligned_shelf() == 1
+        book.ebook_source_id = "remapped-ebook"
+        monkeypatch.setenv("BOOKLORE_SHELF_REQUIRE_ALIGNMENT", "false")
+        monkeypatch.delenv("BOOKLORE_SHELF_OWNER")
+        monkeypatch.setenv("BOOKLORE_SHELF_NAME", "Renamed shelf")
+        required.acting_as(reader)
+        required.cleanup(book, tmp_path)
+
+        owner_client.remove_book_id_from_shelf.assert_called_once_with("45", "ABS Synced")
+        reader_client.remove_book_id_from_shelf.assert_not_called()
+        reader_client.remove_from_shelf.assert_not_called()
+        assert required.db.get_shelf_assignments("a1") == []
+
+    def test_shared_claim_keeps_assignment_until_final_mapping_delete(self, required, tmp_path):
+        book = required.book(align_method="lexical")
+        leaver, _ = required.user("leaver")
+        keeper, _ = required.user("keeper")
+        owner, owner_client = required.owner()
+        required.db.link_user_book(leaver, "a1")
+        required.db.link_user_book(keeper, "a1")
+        required.db.add_pending_shelf_add("a1", leaver)
+        assert web_server._reconcile_aligned_shelf() == 1
+
+        web_server._delete_or_unlink_book(SimpleNamespace(id=leaver), "a1", book)
+
+        assert required.db.get_shelf_assignments("a1") == [{
+            "abs_id": "a1", "reader_id": leaver,
+            "target_user_id": owner, "shelf_name": "ABS Synced", "source_id": "45",
+        }]
+        monkeypatch = required.monkeypatch
+        monkeypatch.setenv("BOOKLORE_SHELF_REQUIRE_ALIGNMENT", "false")
+        monkeypatch.setattr(web_server, "manager", MagicMock(cancel_background_job=MagicMock(return_value=False)))
+        monkeypatch.setattr(web_server, "DATA_DIR", tmp_path, raising=False)
+        web_server.container.epub_cache_dir.return_value = str(tmp_path)
+
+        web_server._delete_or_unlink_book(SimpleNamespace(id=keeper), "a1", book)
+
+        owner_client.remove_book_id_from_shelf.assert_called_once_with("45", "ABS Synced")
+        assert required.db.get_shelf_assignments("a1") == []
+
+    def test_failed_recorded_target_removal_keeps_assignment(self, required, tmp_path):
+        book = required.book(align_method="lexical")
+        reader, _ = required.user("reader")
+        owner, owner_client = required.owner()
+        required.db.add_pending_shelf_add("a1", reader)
+        assert web_server._reconcile_aligned_shelf() == 1
+        owner_client.remove_book_id_from_shelf.return_value = False
+
+        required.cleanup(book, tmp_path)
+
+        owner_client.remove_book_id_from_shelf.assert_called_once_with("45", "ABS Synced")
+        assert required.db.get_shelf_assignments("a1") == [{
+            "abs_id": "a1", "reader_id": reader,
+            "target_user_id": owner, "shelf_name": "ABS Synced", "source_id": "45",
+        }]
+
     def test_reader_removes_by_id_from_their_own_shelf(self, required, tmp_path):
         book = required.book()
         reader, client = required.user("reader", shelf_name="Reading")

@@ -89,6 +89,7 @@ def _manifest_signature(book) -> tuple:
 _SQL_IN_CHUNK = 500
 
 _PENDING_SHELF_ADDS_KEY = "BOOKLORE_SHELF_PENDING_ADDS"
+_SHELF_ASSIGNMENTS_KEY = "BOOKLORE_SHELF_ASSIGNMENTS"
 
 
 class DatabaseService:
@@ -332,6 +333,41 @@ class DatabaseService:
             if len(kept) != len(pending):
                 self.set_json_setting(_PENDING_SHELF_ADDS_KEY, kept)
 
+    def get_shelf_assignments(self, abs_id: Optional[str] = None) -> list[dict]:
+        """Return recorded successful Grimmory shelf targets."""
+        assignments = self.get_json_setting(_SHELF_ASSIGNMENTS_KEY, default=[])
+        if not isinstance(assignments, list):
+            return []
+        valid = [entry for entry in assignments if isinstance(entry, dict)
+                 and isinstance(entry.get("abs_id"), str)
+                 and isinstance(entry.get("shelf_name"), str)
+                 and (entry.get("reader_id") is None or isinstance(entry.get("reader_id"), int))
+                 and (entry.get("target_user_id") is None or isinstance(entry.get("target_user_id"), int))]
+        return [entry for entry in valid if abs_id is None or entry["abs_id"] == abs_id]
+
+    def record_shelf_assignment(
+        self, abs_id: str, reader_id: Optional[int], target_user_id: Optional[int],
+        shelf_name: str, source_id: Optional[str] = None,
+    ) -> None:
+        """Remember where a deferred Grimmory shelf add actually succeeded."""
+        entry = {
+            "abs_id": abs_id, "reader_id": reader_id,
+            "target_user_id": target_user_id, "shelf_name": shelf_name,
+            "source_id": source_id,
+        }
+        with self._pending_shelf_adds_lock:
+            assignments = self.get_shelf_assignments()
+            if entry not in assignments:
+                self.set_json_setting(_SHELF_ASSIGNMENTS_KEY, assignments + [entry])
+
+    def remove_shelf_assignments(self, abs_id: str) -> None:
+        """Forget recorded Grimmory targets after mapping cleanup succeeds."""
+        with self._pending_shelf_adds_lock:
+            assignments = self.get_shelf_assignments()
+            kept = [entry for entry in assignments if entry["abs_id"] != abs_id]
+            if len(kept) != len(assignments):
+                self.set_json_setting(_SHELF_ASSIGNMENTS_KEY, kept)
+
     # ------------------------------------------------------------------
     # Users (multi-user)
     # ------------------------------------------------------------------
@@ -511,6 +547,20 @@ class DatabaseService:
             session.expunge(cred)
             cred.value = plain
             return cred
+
+    def set_user_credentials(self, user_id: int, values: dict[str, str]) -> None:
+        """Save related credentials atomically, encrypting secret values at rest."""
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+        with self.get_session() as session:
+            for key, value in values.items():
+                stored = self._store_value(key, value)
+                session.execute(sqlite_insert(UserCredential).values(
+                    user_id=user_id, key=key, value=stored,
+                ).on_conflict_do_update(
+                    index_elements=[UserCredential.user_id, UserCredential.key],
+                    set_={"value": stored},
+                ))
 
     def encrypt_plaintext_secrets(self) -> int:
         """Wrap any secret still sitting in plaintext, in both credential stores.

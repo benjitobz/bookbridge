@@ -1901,14 +1901,16 @@ def _mirror_kosync_login(user, registry, holders):
 
     changed = []
     if stored_user != username:
-        database_service.set_user_credential(user.id, "KOSYNC_USER", username)
         changed.append("username")
     if stored_key != password:
-        database_service.set_user_credential(user.id, "KOSYNC_KEY", password)
         changed.append("password")
     fingerprint = _kosync_login_fingerprint(username, password)
-    if mirrored != fingerprint:
-        database_service.set_user_credential(user.id, KOSYNC_MIRRORED_LOGIN_KEY, fingerprint)
+    if changed or mirrored != fingerprint:
+        database_service.set_user_credentials(user.id, {
+            "KOSYNC_USER": username,
+            "KOSYNC_KEY": password,
+            KOSYNC_MIRRORED_LOGIN_KEY: fingerprint,
+        })
     if not changed:
         return False
     registry.invalidate(user.id)
@@ -2317,6 +2319,11 @@ def _is_abs_hosted_ebook_filename(filename) -> bool:
 
 
 def _aligned_shelf_target(user_id):
+    client, shelf, _ = _aligned_shelf_assignment(user_id)
+    return client, shelf
+
+
+def _aligned_shelf_assignment(user_id):
     global_shelf = (os.environ.get('BOOKLORE_SHELF_NAME') or 'Kobo').strip()
     owner = (os.environ.get('BOOKLORE_SHELF_OWNER') or '').strip()
     if owner:
@@ -2329,18 +2336,19 @@ def _aligned_shelf_target(user_id):
                 "the shelf is left alone until it is",
                 sanitize_log_data(owner),
             )
-            return None, None
+            return None, None, None
         get_persistent_condition_logger().resolve(
             logger,
             "grimmory_shelf_owner_inactive",
             "✅ Grimmory shelf owner '%s' is an active BookBridge user again",
             sanitize_log_data(owner),
         )
-        return container.user_client_registry().get_clients(user.id).booklore_client, global_shelf
+        return container.user_client_registry().get_clients(user.id).booklore_client, global_shelf, user.id
     if user_id is None:
-        return _global_clients.booklore_client, global_shelf
+        return _global_clients.booklore_client, global_shelf, None
     bundle = container.user_client_registry().get_clients(user_id)
-    return bundle.booklore_client, resolve_setting(bundle.credentials, 'BOOKLORE_SHELF_NAME', 'Kobo')
+    return (bundle.booklore_client,
+            resolve_setting(bundle.credentials, 'BOOKLORE_SHELF_NAME', 'Kobo'), user_id)
 
 
 def _reconcile_aligned_shelf():
@@ -2369,10 +2377,13 @@ def _reconcile_aligned_shelf():
                 continue
             if (required and book.status != 'active') or (reader is not None and not reader.active):
                 continue
-            client, shelf = _aligned_shelf_target(user_id)
+            client, shelf, target_user_id = _aligned_shelf_assignment(user_id)
             if client is None or not client.is_configured():
                 continue
             if client.add_book_id_to_shelf(book.ebook_source_id, shelf):
+                database_service.record_shelf_assignment(
+                    abs_id, user_id, target_user_id, shelf, book.ebook_source_id
+                )
                 database_service.remove_pending_shelf_adds(abs_id, user_id)
                 added += 1
                 logger.info("🏷️ '%s' added to Grimmory shelf '%s'",
@@ -8387,7 +8398,8 @@ def _auto_match_suggestions(results: object, user_id: int | None) -> object:
 
     for suggestion in suggestions:
         matches = suggestion.get('matches') or []
-        eligible_matches = [m for m in matches if not _is_same_folder_match(m)]
+        eligible_matches = [m for m in matches if not _is_same_folder_match(m)
+                            and not is_comic_ebook_filename(m.get('ebook_filename'))]
         best_overall = max(matches, key=lambda m: m.get('score') or 0.0) if matches else None
         top = max(eligible_matches, key=lambda m: m.get('score') or 0.0) if eligible_matches else None
         if best_overall is not None and _is_same_folder_match(best_overall):
@@ -8924,7 +8936,10 @@ def _queue_item_from_suggestion(suggestion: dict) -> "dict | None":
     bridge_key = (suggestion or {}).get('bridge_key') or (suggestion or {}).get('abs_id')
     if not matches or not bridge_key:
         return None
-    top = matches[0]
+    top = next((match for match in matches
+                if not is_comic_ebook_filename(match.get('ebook_filename'))), None)
+    if top is None:
+        return None
     ebook_filename = top.get('ebook_filename') or ''
     if not ebook_filename:
         return None
@@ -9482,6 +9497,10 @@ def cleanup_mapping_resources(book, defer_audio_cache: bool = False):
         is_bookorbit = (getattr(book, 'ebook_source', None) or '').strip().lower() == 'bookorbit'
         is_kavita = (getattr(book, 'ebook_source', None) or '').strip().lower() == 'kavita'
         try:
+            shelf_assignments = (
+                database_service.get_shelf_assignments(book.abs_id)
+                if not is_bookorbit and not is_kavita else []
+            )
             database_service.remove_pending_shelf_adds(book.abs_id, all_users=True)
             if is_bookorbit:
                 client = clients.bookorbit_client
@@ -9501,6 +9520,33 @@ def cleanup_mapping_resources(book, defer_audio_cache: bool = False):
                         client.remove_book_id_from_shelf(ebook_source_id, shelf_name)
                     else:
                         client.remove_from_shelf(shelf_filename, shelf_name)
+            elif shelf_assignments:
+                removed_targets = set()
+                cleanup_succeeded = True
+                for assignment in shelf_assignments:
+                    source_id = assignment.get('source_id') or book.ebook_source_id
+                    target = (assignment['target_user_id'], assignment['shelf_name'], source_id)
+                    if target in removed_targets:
+                        continue
+                    removed_targets.add(target)
+                    target_user_id, shelf_name, source_id = target
+                    if target_user_id is None:
+                        client = _global_clients.booklore_client
+                    else:
+                        try:
+                            client = container.user_client_registry().get_clients(
+                                target_user_id
+                            ).booklore_client
+                        except Exception:
+                            cleanup_succeeded = False
+                            continue
+                    if (not client.is_configured()
+                            or not client.remove_book_id_from_shelf(
+                                source_id, shelf_name
+                            )):
+                        cleanup_succeeded = False
+                if cleanup_succeeded:
+                    database_service.remove_shelf_assignments(book.abs_id)
             elif shelf_add_waits_for_alignment(book):
                 client, shelf_name = _aligned_shelf_target(get_current_user_id())
                 if client is not None and client.is_configured():

@@ -1199,6 +1199,13 @@ class TestKosyncEndpoints(unittest.TestCase):
         }
         return admin_id, client, container, manifest
 
+    def _use_booklore_shelf_payloads(self, client, payloads):
+        from src.api.booklore_client import BookloreClient
+
+        reader = BookloreClient.__new__(BookloreClient)
+        reader._get_json_or_none = lambda endpoint, context: payloads[endpoint]
+        client.get_shelf_book_ids.side_effect = reader.get_shelf_book_ids
+
     def _expire_shelf_filter_cache(self):
         from src.api import kosync_server
 
@@ -1293,6 +1300,57 @@ class TestKosyncEndpoints(unittest.TestCase):
                 kosync_server._scope_manifest_to_user(manifest, admin_id)
 
         self.assertEqual(kosync_server._booklore_shelf_filter_cache, {})
+
+    def test_device_sync_manifest_shelf_filter_uses_stale_membership_on_malformed_payload(self):
+        from src.api import kosync_server
+
+        admin_id, client, container, manifest = self._shelf_filter_fixture("Kobo")
+        payloads = {
+            "/api/v1/shelves": [{"id": 7, "name": "Kobo"}],
+            "/api/v1/shelves/7/books": [{"id": 1}],
+        }
+        self._use_booklore_shelf_payloads(client, payloads)
+        with patch.object(kosync_server, "_container", container):
+            kosync_server._scope_manifest_to_user(manifest, admin_id)
+            self._expire_shelf_filter_cache()
+            payloads["/api/v1/shelves/7/books"] = {"unexpected": "not a book list"}
+            scoped = kosync_server._scope_manifest_to_user(manifest, admin_id)
+
+        self.assertEqual([item["abs_id"] for item in scoped["books"]], ["on-kobo"])
+
+    def test_device_sync_manifest_returns_503_when_malformed_shelf_payload_has_no_cache(self):
+        from src.api import kosync_server
+
+        _admin_id, client, container, manifest = self._shelf_filter_fixture("Kobo")
+        self._use_booklore_shelf_payloads(client, {
+            "/api/v1/shelves": [{"id": 7, "name": "Kobo"}],
+            "/api/v1/shelves/7/books": {"unexpected": "not a book list"},
+        })
+        with kosync_server._manifest_cache_lock:
+            saved_manifest = kosync_server._manifest_cache
+            kosync_server._manifest_cache = manifest
+        try:
+            with patch.object(kosync_server, "_container", container), \
+                 patch.object(kosync_server, "_start_manifest_prebuilder"):
+                response = self.client.get("/koreader/device-sync/manifest", headers=self.auth_headers)
+        finally:
+            with kosync_server._manifest_cache_lock:
+                kosync_server._manifest_cache = saved_manifest
+
+        self.assertEqual(response.status_code, 503)
+
+    def test_device_sync_manifest_accepts_a_valid_empty_shelf(self):
+        from src.api import kosync_server
+
+        admin_id, client, container, manifest = self._shelf_filter_fixture("Kobo")
+        self._use_booklore_shelf_payloads(client, {
+            "/api/v1/shelves": [{"id": 7, "name": "Kobo"}],
+            "/api/v1/shelves/7/books": [],
+        })
+        with patch.object(kosync_server, "_container", container):
+            scoped = kosync_server._scope_manifest_to_user(manifest, admin_id)
+
+        self.assertEqual(scoped["books"], [])
 
     def test_device_sync_manifest_shelf_filter_withholds_manifest_when_grimmory_is_down(self):
         from src.api import kosync_server

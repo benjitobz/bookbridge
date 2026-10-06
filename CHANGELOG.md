@@ -6,8 +6,32 @@ All notable changes to BookBridge will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- Link CBZ comics as ebooks without allowing them to become audiobook matches (#459).
+- Optionally filter KOReader device manifests to selected Grimmory shelves (#464).
+- Prefer ebooks already mounted in the configured library, with provider fallback
+  when no safe mounted file is available (#470).
+- Defer optional Grimmory shelf additions until alignment is ready, using the
+  configured shelf owner's account when enabled (#471).
+- Scan for suggestions on a schedule as the default user (#472).
+- Share automatic ebook matches across users. Re-enabling an account restores its
+  catalog, including books that account previously removed (#473).
+- Reconcile Audiobookshelf collections with the configured mappings (#474).
+- Optionally mirror Grimmory KoSync logins while preserving manually managed
+  credentials (#475).
+
 ### Fixed
 
+- Malformed shelf membership and filter data no longer appears as a valid empty
+  device manifest (#464).
+- Directory links under a mounted library can no longer expose files outside the
+  configured roots; lookup continues through the cache and provider fallbacks (#470).
+- Disabling aligned-shelf waiting no longer changes which account removes a
+  previously added shelf entry (#471).
+- Failed credential rotation no longer leaves a partial Grimmory KoSync login
+  saved (#475).
+- Comic matches can no longer enter bulk or automatic audiobook mappings (#459).
 - BookFusion duplicate uploads now accept author objects as well as strings while
   preserving exact title and author matching.
 - Ebook lookup continues through other libraries when a directory disappears or

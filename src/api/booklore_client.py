@@ -3407,8 +3407,11 @@ class BookloreClient:
         payload = self._get_json_or_none("/api/v1/shelves", "Grimmory shelves list")
         if payload is None:
             return None
+        shelves = self._shelf_list_payload(payload, "shelves", fields=("id", "name"), allow_single=True)
+        if shelves is None:
+            return None
         members: dict[str, set[str]] = {}
-        for shelf in self._normalize_shelves_payload(payload):
+        for shelf in shelves:
             shelf_name = str(shelf.get("name") or "").strip()
             if shelf_name.casefold() not in wanted:
                 continue
@@ -3417,7 +3420,9 @@ class BookloreClient:
             )
             if data is None:
                 return None
-            books = data.get("content", data.get("books", [])) if isinstance(data, dict) else data
+            books = self._shelf_list_payload(data, "content", "books", fields=("id",))
+            if books is None:
+                return None
             members.setdefault(shelf_name, set()).update(
                 str(book["id"]) for book in books if isinstance(book, dict) and book.get("id") is not None
             )
@@ -3428,8 +3433,11 @@ class BookloreClient:
         payload = self._get_json_or_none("/api/magic-shelves", "Grimmory magic shelves list")
         if payload is None:
             return None
+        magic_shelves = self._shelf_list_payload(payload, "shelves", fields=("id", "name"), allow_single=True)
+        if magic_shelves is None:
+            return None
         magic_shelves = [
-            shelf for shelf in self._normalize_shelves_payload(payload)
+            shelf for shelf in magic_shelves
             if str(shelf.get("name") or "").strip().casefold() in missing
         ]
         if not magic_shelves:
@@ -3437,13 +3445,72 @@ class BookloreClient:
         data = self._get_json_or_none("/api/v1/books", "Grimmory all books for filter")
         if data is None:
             return None
-        all_books = data.get("content", data.get("books", [])) if isinstance(data, dict) else data
+        all_books = self._shelf_list_payload(data, "content", "books", fields=("id",))
+        if all_books is None:
+            return None
         for shelf in magic_shelves:
+            filter_raw = shelf.get("filterJson")
+            if not filter_raw:
+                return None
+            try:
+                filter_tree = json.loads(filter_raw) if isinstance(filter_raw, str) else filter_raw
+            except (json.JSONDecodeError, TypeError):
+                return None
+            if not self._valid_magic_shelf_filter(filter_tree):
+                return None
             members.setdefault(str(shelf["name"]).strip(), set()).update(
                 str(book["id"]) for book in self._evaluate_magic_shelf(shelf, all_books)
                 if isinstance(book, dict) and book.get("id") is not None
             )
         return members
+
+    @staticmethod
+    def _shelf_list_payload(payload, *keys, fields=(), allow_single=False):
+        def valid(items):
+            return all(
+                isinstance(item, dict) and all(item.get(field) not in (None, "") for field in fields)
+                for item in items
+            )
+
+        if isinstance(payload, list):
+            return payload if valid(payload) else None
+        if isinstance(payload, dict):
+            for key in keys:
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return value if valid(value) else None
+            if allow_single and valid([payload]):
+                return [payload]
+        return None
+
+    @classmethod
+    def _valid_magic_shelf_filter(cls, group):
+        if not isinstance(group, dict):
+            return False
+        if set(group) - {"type", "join", "rules"}:
+            return False
+        if group.get("type", "group") != "group":
+            return False
+        if group.get("join", "and") not in ("and", "or"):
+            return False
+        rules = group.get("rules", [])
+        if not isinstance(rules, list):
+            return False
+        operators = {
+            "equals", "not_equals", "contains", "not_contains", "does_not_contain",
+            "starts_with", "ends_with", "includes_any", "includes_all", "excludes_all",
+            "is_empty", "is_not_empty", "gt", "gte", "lt", "lte",
+            "greater_than", "greater_than_equal_to", "less_than", "less_than_equal_to",
+        }
+        return all(
+            cls._valid_magic_shelf_filter(rule)
+            if rule.get("type") == "group"
+            else not (set(rule) - {"type", "field", "operator", "value"})
+            and rule.get("type") in (None, "rule")
+            and isinstance(rule.get("field"), str) and bool(rule["field"])
+            and rule.get("operator") in operators
+            for rule in rules if isinstance(rule, dict)
+        ) and all(isinstance(rule, dict) for rule in rules)
 
     def _normalize_shelves_payload(self, payload):
         if isinstance(payload, list):

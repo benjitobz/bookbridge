@@ -41,6 +41,9 @@ class FakeDatabase:
     def set_user_credential(self, user_id, key, value):
         self.creds.setdefault(user_id, {})[key] = value
 
+    def set_user_credentials(self, user_id, values):
+        self.creds.setdefault(user_id, {}).update(values)
+
     def _default_user_id(self):
         return self.default_user_id
 
@@ -331,6 +334,34 @@ class TestAgainstRealDatabase(unittest.TestCase):
             conn.close()
         self.assertEqual(1, len(rows))
         self.assertTrue(secret_store.is_encrypted(rows[0][0]))
+
+    def test_interrupted_rotation_rolls_back_and_can_retry(self):
+        from sqlalchemy import event
+
+        registry = make_registry({self.first.id: grimmory_client(), self.second.id: grimmory_client()})
+        with mirror_globals(self.svc, registry):
+            web_server._mirror_kosync_logins_from_grimmory()
+            original = self.svc.get_user_credentials(self.first.id)
+            client = registry.get_clients(self.first.id).booklore_client
+            client.get_koreader_sync_login.return_value = ("rotated-reader", "rotated-password")
+            registry.invalidate.reset_mock()
+
+            def fail_password(conn, cursor, statement, parameters, context, executemany):
+                if statement.startswith("INSERT INTO user_credentials") and "KOSYNC_KEY" in parameters:
+                    raise RuntimeError("temporary database write failure")
+
+            engine = self.svc.db_manager.engine
+            event.listen(engine, "before_cursor_execute", fail_password)
+            try:
+                web_server._mirror_kosync_logins_from_grimmory()
+            finally:
+                event.remove(engine, "before_cursor_execute", fail_password)
+            self.assertEqual(original, self.svc.get_user_credentials(self.first.id))
+            registry.invalidate.assert_not_called()
+            self.assertEqual(1, web_server._mirror_kosync_logins_from_grimmory())
+            self.assertEqual((True, self.first.id), self.authenticate(
+                "rotated-reader", hash_kosync_key("rotated-password")))
+            registry.invalidate.assert_called_once_with(self.first.id)
 
 
 class TestClientLogin(unittest.TestCase):
