@@ -1596,6 +1596,20 @@ def _apply_user_admin_action(form):
                     except Exception:
                         pass
                     message = f"{'Disabled' if disabling else 'Enabled'} '{target.username}'"
+                    if not disabling and env_truthy('SHARE_ALL_BOOKS_WITH_ALL_USERS'):
+                        try:
+                            linked = database_service.backfill_user_books_for_user(uid)
+                            logger.info(
+                                "🔗 Shared %d existing book(s) with re-enabled user '%s' (share-all-books enabled)",
+                                linked, sanitize_log_data(target.username),
+                            )
+                            if linked:
+                                message = f"Enabled '{target.username}' and shared {linked} book(s)"
+                        except Exception as share_err:
+                            logger.warning(
+                                "Could not backfill shared books for re-enabled user '%s': %s",
+                                sanitize_log_data(target.username), share_err, exc_info=True,
+                            )
         elif action == 'set_role':
             uid = int(form.get('user_id'))
             new_role = (form.get('role') or '').strip().lower()

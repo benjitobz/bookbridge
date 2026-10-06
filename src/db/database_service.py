@@ -1011,6 +1011,7 @@ class DatabaseService:
     def save_book(self, book: Book) -> Book:
         """Save or update a book model."""
         from sqlalchemy.exc import IntegrityError
+        from src.utils.config_loader import env_truthy
 
         with self.get_session() as session:
             existing = session.query(Book).filter(Book.abs_id == book.abs_id).first()
@@ -1036,6 +1037,22 @@ class DatabaseService:
                     ).first()
                     if not exists:
                         session.add(UserBook(user_id=creator_uid, abs_id=book.abs_id))
+                if existing is None and env_truthy('SHARE_ALL_BOOKS_WITH_ALL_USERS'):
+                    user_ids = {
+                        row[0] for row in session.query(User.id).filter(User.active == 1).all()
+                    }
+                    claimed = {
+                        row[0] for row in
+                        session.query(UserBook.user_id).filter(UserBook.abs_id == book.abs_id).all()
+                    }
+                    missing = user_ids - claimed
+                    for user_id in missing:
+                        session.add(UserBook(user_id=user_id, abs_id=book.abs_id))
+                    if missing:
+                        logger.info(
+                            "🔗 Shared new book '%s' with %d additional user(s) (share-all-books enabled)",
+                            book.abs_id, len(missing),
+                        )
 
             if existing:
                 # Update existing book
@@ -1374,8 +1391,8 @@ class DatabaseService:
     def backfill_user_books_for_user(self, user_id: int) -> int:
         """Claim every catalog book for one user. Returns links created.
 
-        Used when a new account is created while share-all-books is on, so they
-        start with the same library everyone else already sees.
+        Used when an account is created or re-enabled while share-all-books is on,
+        so they start with the same library everyone else already sees.
         """
         if user_id is None:
             return 0
