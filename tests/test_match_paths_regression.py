@@ -2357,7 +2357,7 @@ class TestMatchPathsRegression(unittest.TestCase):
         self.mock_container.mock_bookorbit_client.move_between_shelves.assert_called_once_with(
             "bookorbit-origin.epub", "Up Next", "Kobo"
         )
-        mock_shelve.assert_called_once_with("source.epub", "BookOrbit", "bo-17")
+        mock_shelve.assert_called_once_with("source.epub", "BookOrbit", "bo-17", book=unittest.mock.ANY)
 
     @patch(
         "src.web_server._create_or_update_bookfusion_progress_mapping",

@@ -37,6 +37,7 @@ from src.utils.user_context import (
 from src.utils.user_config import user_setting
 from src.utils.user_config import global_fallback_allowed as _global_fallback_allowed
 from src.utils.user_config import SERVICE_ENABLE_KEYS
+from src.utils.user_config import resolve_setting
 
 from src.utils.config_loader import ConfigLoader, KNOWN_SETTING_KEYS, env_truthy
 from src.utils.cache_paths import safe_cache_path, safe_library_path, is_plain_basename
@@ -51,6 +52,7 @@ from src.utils.logging_utils import memory_log_handler, LOG_PATH
 from src.utils.logging_utils import sanitize_log_data
 from src.utils.logging_utils import get_persistent_condition_logger
 from src.services.diagnostics import setup_diagnostics_logging
+from src.services.aligned_shelf import defer_shelf_add, shelf_add_waits_for_alignment
 from src.services import whats_new
 from src.api.api_clients import ABS_DISABLED_SENTINEL, is_abs_disabled_value
 from src.api.kosync_server import kosync_sync_bp, kosync_admin_bp, init_kosync_server, signal_manifest_rebuild
@@ -1856,6 +1858,7 @@ def sync_daemon():
         schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(manager.run_sync_for_all_users)
         schedule.every(1).minutes.do(manager.check_pending_jobs)
         schedule.every(1).minutes.do(manager.flush_reading_sessions_for_all_users)
+        schedule.every(int(SYNC_PERIOD_MINS)).minutes.do(_reconcile_aligned_shelf)
         schedule.every(1).hours.do(_run_diagnostics_send)
 
         logger.info(f"🔄 Sync daemon started (period: {SYNC_PERIOD_MINS} minutes)")
@@ -1865,6 +1868,8 @@ def sync_daemon():
             manager.run_sync_for_all_users()
         except Exception as e:
             logger.error(f"❌ Initial sync cycle failed: {e}", exc_info=True)
+
+        _reconcile_aligned_shelf()
 
         # Catch-up diagnostics send on startup (24h guard inside is a no-op when not due)
         try:
@@ -2134,7 +2139,74 @@ def _is_abs_hosted_ebook_filename(filename) -> bool:
         return False
     return "_abs." in filename
 
-def _shelve_matched_ebook(shelf_filename, ebook_source=None, ebook_source_id=None):
+
+def _aligned_shelf_target(user_id):
+    global_shelf = (os.environ.get('BOOKLORE_SHELF_NAME') or 'Kobo').strip()
+    owner = (os.environ.get('BOOKLORE_SHELF_OWNER') or '').strip()
+    if owner:
+        user = database_service.get_user_by_username(owner)
+        if user is None or not user.active:
+            get_persistent_condition_logger().warn(
+                logger,
+                "grimmory_shelf_owner_inactive",
+                "⚠️ Grimmory shelf owner '%s' is not an active BookBridge user — "
+                "the shelf is left alone until it is",
+                sanitize_log_data(owner),
+            )
+            return None, None
+        get_persistent_condition_logger().resolve(
+            logger,
+            "grimmory_shelf_owner_inactive",
+            "✅ Grimmory shelf owner '%s' is an active BookBridge user again",
+            sanitize_log_data(owner),
+        )
+        return container.user_client_registry().get_clients(user.id).booklore_client, global_shelf
+    if user_id is None:
+        return _global_clients.booklore_client, global_shelf
+    bundle = container.user_client_registry().get_clients(user_id)
+    return bundle.booklore_client, resolve_setting(bundle.credentials, 'BOOKLORE_SHELF_NAME', 'Kobo')
+
+
+def _reconcile_aligned_shelf():
+    if database_service is None:
+        return
+    try:
+        pending = database_service.get_pending_shelf_adds()
+        if not pending:
+            return
+        required = env_truthy('BOOKLORE_SHELF_REQUIRE_ALIGNMENT')
+        aligned = database_service.get_readalong_alignment_book_ids() if required else set()
+        users = {user.id: user for user in database_service.list_users()}
+        added = 0
+        for abs_id, user_id in pending:
+            if required and abs_id not in aligned:
+                continue
+            book = database_service.get_book(abs_id)
+            reader = users.get(user_id)
+            if (
+                book is None
+                or not is_grimmory_source(book.ebook_source)
+                or not book.ebook_source_id
+                or (user_id is not None and reader is None)
+            ):
+                database_service.remove_pending_shelf_adds(abs_id, user_id)
+                continue
+            if (required and book.status != 'active') or (reader is not None and not reader.active):
+                continue
+            client, shelf = _aligned_shelf_target(user_id)
+            if client is None or not client.is_configured():
+                continue
+            if client.add_book_id_to_shelf(book.ebook_source_id, shelf):
+                database_service.remove_pending_shelf_adds(abs_id, user_id)
+                added += 1
+                logger.info("🏷️ '%s' added to Grimmory shelf '%s'",
+                            sanitize_log_data(book.abs_title or book.abs_id), shelf)
+        return added
+    except Exception as e:
+        logger.warning("Aligned-shelf reconcile failed: %s", e, exc_info=True)
+
+
+def _shelve_matched_ebook(shelf_filename, ebook_source=None, ebook_source_id=None, book=None):
     """Add a newly matched ebook to the Kobo shelf and clear it from the
     shelf-watch "Up Next" shelf, on whichever library hosts the ebook.
 
@@ -2196,6 +2268,8 @@ def _shelve_matched_ebook(shelf_filename, ebook_source=None, ebook_source_id=Non
     try:
         if use_id:
             added = client.add_book_id_to_shelf(ebook_source_id, kobo_shelf)
+        elif defer_shelf_add(database_service, book, get_current_user_id()):
+            added = True
         else:
             added = client.add_to_shelf(shelf_filename, kobo_shelf)
     except Exception as e:
@@ -2241,6 +2315,7 @@ def _shelve_saved_ebook(book) -> None:
         shelf_filename,
         getattr(book, 'ebook_source', None),
         getattr(book, 'ebook_source_id', None),
+        book=book,
     )
     _spawn_user_background(_publish_saved_ebook_to_readest, book, label="Readest upload")
 
@@ -3726,6 +3801,7 @@ def _create_or_update_library_audio_mapping(
                 shelf_filename,
                 ebook_source=saved_book.ebook_source,
                 ebook_source_id=saved_book.ebook_source_id,
+                book=saved_book,
             )
         except Exception as shelf_err:
             logger.warning(f"Failed to shelve matched ebook '{shelf_filename}': {shelf_err}", exc_info=True)
@@ -4143,6 +4219,7 @@ def settings():
             'STORYTELLER_LISTENING_SESSIONS',
             'STORYTELLER_NO_EPUB_CACHE',
             'BOOKLORE_SHELF_WATCH_ENABLED',
+            'BOOKLORE_SHELF_REQUIRE_ALIGNMENT',
             'BOOKORBIT_ENABLED',
             'BOOKORBIT_READING_SESSIONS',
             'BOOKORBIT_SHELF_WATCH_ENABLED',
@@ -4988,7 +5065,7 @@ def _queue_item_shelf_watch_metadata(item: dict) -> "dict | None":
     return None
 
 
-def _complete_shelf_watch_approval(meta: dict, *, remove_only: bool = False) -> bool:
+def _complete_shelf_watch_approval(meta: dict, *, remove_only: bool = False, book=None) -> bool:
     """Finish the recorded shelf-watch move without failing a saved mapping."""
     if not meta:
         return False
@@ -5001,7 +5078,7 @@ def _complete_shelf_watch_approval(meta: dict, *, remove_only: bool = False) -> 
             return False
         if watch_shelf == kobo_shelf:
             return True
-        if remove_only:
+        if remove_only or defer_shelf_add(database_service, book, get_current_user_id()):
             success = library_client.remove_from_shelf(filename, watch_shelf)
             action = f"remove from '{watch_shelf}'"
         else:
@@ -6869,7 +6946,7 @@ def match():
         shelf_filename = original_ebook_filename or ebook_filename
         if shelf_filename and not _is_storyteller_artifact_filename(shelf_filename):
             _shelve_matched_ebook(shelf_filename, getattr(book, "ebook_source", None),
-                                  getattr(book, "ebook_source_id", None))
+                                  getattr(book, "ebook_source_id", None), book=book)
         if clients.storyteller_client.is_configured():
             if book.storyteller_uuid:
                 clients.storyteller_client.add_to_collection_by_uuid(book.storyteller_uuid)
@@ -7291,9 +7368,9 @@ def _process_batch_queue(queue_items):
         if not str(item['abs_id']).startswith('booklore:'):
             clients.abs_client.add_to_collection(item['abs_id'], user_setting("ABS_COLLECTION_NAME", "Synced with KOReader"))
         shelf_filename = original_ebook_filename or ebook_filename
-        if not _complete_shelf_watch_approval(shelf_watch_meta) and shelf_filename:
+        if not _complete_shelf_watch_approval(shelf_watch_meta, book=book) and shelf_filename:
             _shelve_matched_ebook(shelf_filename, item.get('ebook_source'),
-                                  item.get('ebook_source_id'))
+                                  item.get('ebook_source_id'), book=book)
         if clients.storyteller_client.is_configured():
             if book.storyteller_uuid:
                 clients.storyteller_client.add_to_collection_by_uuid(book.storyteller_uuid)
@@ -7476,9 +7553,9 @@ def _process_forge_match_queue(queue_items):
             if not str(item['abs_id']).startswith('booklore:'):
                 clients.abs_client.add_to_collection(item['abs_id'], user_setting("ABS_COLLECTION_NAME", "Synced with KOReader"))
             shelf_filename = original_ebook_filename or ebook_filename
-            if not _complete_shelf_watch_approval(shelf_watch_meta) and shelf_filename:
+            if not _complete_shelf_watch_approval(shelf_watch_meta, book=book) and shelf_filename:
                 _shelve_matched_ebook(
-                    shelf_filename, item.get('ebook_source'), item.get('ebook_source_id')
+                    shelf_filename, item.get('ebook_source'), item.get('ebook_source_id'), book=book
                 )
             if clients.storyteller_client.is_configured() and book.storyteller_uuid:
                 clients.storyteller_client.add_to_collection_by_uuid(book.storyteller_uuid)
@@ -7643,7 +7720,7 @@ def _process_forge_match_queue(queue_items):
                 **_client_bundle_kwargs(clients),
             )
 
-        _complete_shelf_watch_approval(shelf_watch_meta)
+        _complete_shelf_watch_approval(shelf_watch_meta, book=book)
         database_service.dismiss_suggestion(forge_id)
         if kosync_doc_id:
             database_service.dismiss_suggestion(kosync_doc_id)
@@ -8062,6 +8139,13 @@ def _auto_match_suggestions(results: object, user_id: int | None) -> object:
             f"🔗 Auto-matched '{suggestion.get('abs_title')}' to "
             f"'{top.get('display_name') or top.get('ebook_filename')}' at {score:.1f}%"
         )
+        try:
+            _shelve_saved_ebook(saved)
+        except Exception as shelf_err:
+            logger.warning(
+                f"Failed to shelve auto-matched ebook for '{suggestion.get('abs_title')}': {shelf_err}",
+                exc_info=True,
+            )
 
     if matched:
         results['suggestions'] = remaining
@@ -9094,6 +9178,7 @@ def cleanup_mapping_resources(book, defer_audio_cache: bool = False):
         is_bookorbit = (getattr(book, 'ebook_source', None) or '').strip().lower() == 'bookorbit'
         is_kavita = (getattr(book, 'ebook_source', None) or '').strip().lower() == 'kavita'
         try:
+            database_service.remove_pending_shelf_adds(book.abs_id, all_users=True)
             if is_bookorbit:
                 client = clients.bookorbit_client
                 if client.is_configured():
@@ -9112,6 +9197,10 @@ def cleanup_mapping_resources(book, defer_audio_cache: bool = False):
                         client.remove_book_id_from_shelf(ebook_source_id, shelf_name)
                     else:
                         client.remove_from_shelf(shelf_filename, shelf_name)
+            elif shelf_add_waits_for_alignment(book):
+                client, shelf_name = _aligned_shelf_target(get_current_user_id())
+                if client is not None and client.is_configured():
+                    client.remove_book_id_from_shelf(book.ebook_source_id, shelf_name)
             else:
                 client = clients.booklore_client
                 if client.is_configured():
@@ -9336,6 +9425,7 @@ def _delete_or_unlink_book(user, abs_id, book) -> None:
     if user is not None and user.id in claimants and len(claimants) > 1:
         database_service.unlink_user_book(user.id, abs_id)
         database_service.delete_states_for_book(abs_id, user_id=user.id)
+        database_service.remove_pending_shelf_adds(abs_id, user.id)
         return
     worker_cancelled = manager.cancel_background_job(abs_id)
     database_service.delete_book(abs_id)
