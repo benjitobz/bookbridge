@@ -130,7 +130,7 @@ The bridge **is** a KoSync server — KOReader devices sync directly with it. De
 | Highlight Sync | `KOREADER_ANNOTATION_SYNC` | `true` | Enables bridge-side annotation exchange for the Bridge Sync KOReader plugin. Requires the current Bridge Sync plugin on each device. |
 | Sync Reading Status Between Devices | `KOREADER_STATUS_SYNC_ENABLED` | `true` | Shares each book's KOReader status (reading / finished / abandoned) across your devices — including filling it in from your reading position, marking a book finished when the bridge decides it is complete, and clearing it when you clear progress. Requires the **BridgeSync 0.9.6** plugin (or newer) on each device. |
 | Share Recently-Read Books Between Devices | `KOREADER_SYNC_READ_HISTORY` | `false` | Adds a book you read on one device into KOReader's History on your others, so views built from History (like a "Recent" shelf) look the same everywhere. Bounded per sync: only books whose file is already on the device, nothing read more than 30 days ago, and at most 25 books. Requires the **BridgeSync 0.9.6** plugin (or newer) on each device. |
-| Target KOSync URL | `KOSYNC_SERVER` | empty | Under **Advanced** on the card. Leave on the built-in server; only set this to relay through a separate external KoSync instance. |
+| Target KOSync URL | `KOSYNC_SERVER` | empty | Under **Advanced** on the card. An empty value uses the built-in server at `http://127.0.0.1:<KOSYNC_PORT or 5757>`, including installs configured only through environment variables. Set another URL only to relay through a separate external KoSync instance. |
 | Split-Port Listener | `KOSYNC_PORT` | empty | Optional dedicated KOSync port for internet-safe exposure. |
 | When Two KOReader Devices Disagree | `KOSYNC_ACTIVE_DEVICE_WINS` | `shadow` | Under **Advanced — cross-device progress**. `shadow` (**Watch and log only**) records the choice the arbiter would make without changing anything readers receive; `on` (**Let the device you are reading on win**) lets the device you are actively reading — proven by several forward page turns in a row — outrank a stale device sitting at the furthest position; `off` (**Always use the furthest position**) keeps the original behavior. |
 
@@ -316,7 +316,7 @@ BookOrbit is a supported ebook and audiobook source. You can use it for ebook sy
 | BookOrbit Audiobook Poll Interval (seconds) | `BOOKORBIT_AUDIO_POLL_SECONDS` | `300` | Used when the audiobook poll mode is `custom`. |
 | Wait for Position to Settle (audiobooks) | `BOOKORBIT_AUDIO_POLL_WAIT_FOR_SETTLE` | `false` | Recommended while listening: holds the sync until playback pauses or stops, instead of writing on every poll. |
 | When BookOrbit Syncs Read-Along Books Itself | `BOOKORBIT_READALONG_POLICY` | `defer` | `defer` (**Let BookOrbit handle it**) writes only the ebook side and lets BookOrbit's own 3.0+ read-along sync move the audio position on a book where BookBridge maps both formats onto the same BookOrbit entry; `takeover` (**Turn BookOrbit's off and drive both sides**) switches that entry's own sync off so BookBridge owns both; `ignore` lets both write, which can conflict. Only matters when a book's audio and text are the same BookOrbit entry — the usual separate-entry setup is unaffected either way. See [troubleshooting](troubleshooting.md#a-read-along-book-keeps-shifting-position-or-bookorbit-and-bookbridge-disagree). |
-| Read-Along Audio Bitrate | `READALONG_AUDIO_BITRATE` | `32k` | Bitrate ffmpeg encodes into a generated read-along EPUB's embedded audio (mono AAC), e.g. `32k`, `48k`. Lower saves storage and download size (roughly 14MB per hour of audio at the default); higher improves quality at the cost of both. An invalid value falls back to the default. Applies only to read-alongs generated after the change — existing ones are not re-encoded. |
+| Read-Along Audio Bitrate | `READALONG_AUDIO_BITRATE` | `32k` | Use `source` to preserve a single AAC LC audiobook without another lossy encode, including its channels and sample rate. Other codecs, multiple input files, or a failed copy fall back to 64 kbps mono AAC. Numeric values such as `32k` or `64k` always encode mono AAC; lower saves space (roughly 14MB per hour at 32k). Invalid values fall back to 32k. Regenerate existing read-alongs to apply a change. |
 
 Optional "Up Next" collection watch — drop a book onto a collection in BookOrbit and the bridge auto-matches it on the next poll:
 
@@ -326,6 +326,12 @@ Optional "Up Next" collection watch — drop a book onto a collection in BookOrb
 | Collection Name | `BOOKORBIT_SHELF_WATCH_NAME` | `Up Next` | Create this collection in BookOrbit. Books placed on it are auto-matched and moved to the collection above on success. |
 | Match Threshold | `BOOKORBIT_SHELF_WATCH_THRESHOLD` | `95` | Minimum match confidence (60–100) before a book is auto-linked. |
 | Rescan Interval (Hours) | `BOOKORBIT_SHELF_WATCH_RESCAN_HOURS` | `24` | How often a still-unmatched book on the watch collection is retried. |
+
+Optional matching of books you start reading — under **Books You Start Reading** on the BookOrbit card:
+
+| Setting | Env Var | Default | Notes |
+| --- | --- | --- | --- |
+| Auto-match books you start reading in BookOrbit | `BOOKORBIT_READING_WATCH_ENABLED` | `false` | Once you are past 1% of a BookOrbit ebook that BookBridge has not matched, it looks for the audiobook. A match is added to **Suggestions** for you to confirm; a book with no audiobook becomes an ebook-only mapping so its progress syncs. A suggestion you dismiss is not offered again. |
 
 BookOrbit notes:
 
@@ -418,6 +424,7 @@ Hardcover provides modern reading tracking with a beautiful UI. BookBridge can p
 | --- | --- | --- | --- |
 | Enable | `HARDCOVER_ENABLED` | `false` | Turns on Hardcover updates. |
 | API Token | `HARDCOVER_TOKEN` | empty | Per-reader personal API token from Hardcover. |
+| Update Cooldown (minutes) | `HARDCOVER_UPDATE_COOLDOWN_MINS` | `60` | Global. Minutes of no new progress before a book's position is posted; new progress restarts the wait. Finishing a book posts at once. `0` posts on every sync cycle. |
 | Highlight Sync | `HARDCOVER_ANNOTATION_SYNC` | `false` | Per-reader. Pushes supported KOReader highlights to Hardcover. |
 | Highlight Sync Interval | `HARDCOVER_ANNOTATION_SYNC_MINUTES` | `30` | Minutes between background Hardcover annotation relay cycles. |
 | Grimmory Shelves to Hardcover Lists | `HARDCOVER_GRIMMORY_LIST_SYNC` | `off` | Per-reader. `off`, `all`, `magic`, or `shelf`. |
@@ -441,12 +448,18 @@ StoryGraph is a popular alternative to Goodreads that focuses on reading data an
 | Enable | `STORYGRAPH_ENABLED` | `false` | Turns on StoryGraph updates. |
 | Session Cookie | `STORYGRAPH_SESSION_COOKIE` | empty | `_storygraph_session` cookie value. |
 | Remember User Token | `STORYGRAPH_REMEMBER_USER_TOKEN` | empty | `remember_user_token` cookie value. |
+| Update Cooldown (minutes) | `STORYGRAPH_UPDATE_COOLDOWN_MINS` | `60` | Global. Minutes of no new progress before a book's position is posted; new progress restarts the wait. Finishing a book posts at once. `0` posts on every sync cycle. |
 
 StoryGraph notes:
 
 - Requires browser cookies for authentication. See the [User Guide](user-guide.md#storygraph-authentication) for instructions on how to retrieve these.
 - Supports **Edition Picking**: Select specific editions (Paperback, Kindle, etc.) to ensure accurate page counts.
 - **Switch Editions**: The bridge can automatically "switch" your tracked edition on StoryGraph to match your selection.
+- When the selected edition has a page count, BookBridge reports estimated page
+  progress and selects **Pages** on the next progress update, even if the book
+  previously used Percentage. This cannot guarantee the exact print page for a
+  reflowable ebook or audiobook. Books without a page count continue using
+  percent.
 
 #### Progress Trackers
 
@@ -454,6 +467,12 @@ Hardcover and StoryGraph are independent - enable either or both on their cards 
 **Settings -> Integrations**. Each reader then picks which they use, and supplies their own
 token/cookies, under **Account -> My Integrations**. Admins can also manage those values under
 **Settings -> Users -> Integrations**.
+
+When a tracker cannot take a book's update — most often because the book has no match
+there, but also when the edition has no page count, the book is missing from the account, or
+the service is down — BookBridge retries after 15 minutes, then waits twice as long each
+time, up to every 6 hours. New reading progress gets a fresh attempt once its cooldown has
+passed. See [troubleshooting](troubleshooting.md#hardcover-or-storygraph-gets-many-requests-or-a-book-never-updates-there).
 
 #### Telegram Notifications
 
@@ -473,6 +492,14 @@ Found under **Settings -> Features**.
 | Setting | Env Var | Default | Notes |
 | --- | --- | --- | --- |
 | Shelfmark URL | `SHELFMARK_URL` | empty | Adds the Shelfmark shortcut when configured. |
+
+#### Series Display
+
+Found under **Settings -> Features**.
+
+| Setting | Env Var | Default | Notes |
+| --- | --- | --- | --- |
+| Show each series as the book you're reading | `SERIES_SHOW_CURRENT_BOOK_DETAIL` | `false` | Each series on the Library becomes the full card of the book you are on (in progress, or the next unread one), with the series name, how many are finished and the other books listed along its bottom. Click that strip to open the rest of the series. Finished series keep their usual card. When off, a closed series shows each book as a compact row. |
 
 #### AI / LLM Providers (Optional)
 
@@ -620,11 +647,15 @@ Found under **Settings -> System**.
 | Data Directory | `DATA_DIR` | `/data` | Database, cache, and working state. |
 | Books Directory | `BOOKS_DIR` | `/books` | Local ebook library path inside the container. |
 | Extra Ebook Directories | `EXTRA_EBOOK_DIRS` | empty | Additional library folders to search, for multi-library setups where some ebooks live outside `BOOKS_DIR`. Comma- or newline-separated container paths. |
-| Audiobooks Directory | `AUDIOBOOKS_DIR` | `/audiobooks` | Optional local audiobook path. |
+| Audiobooks Directory | `AUDIOBOOKS_DIR` | `/audiobooks` | Local audiobook root. When ABS reports a track path inside this directory and its size matches, BookBridge reads that mounted file directly instead of downloading an audio cache copy. Other tracks keep the existing stream/download path. |
 | Storyteller Library Directory | `STORYTELLER_LIBRARY_DIR` | `/storyteller_library` | Optional local Storyteller library path for fallback/download helpers. |
 | Storyteller Assets Directory | `STORYTELLER_ASSETS_DIR` | empty | Optional transcript asset root. |
 | Storyteller Upload Chunk Size | `STORYTELLER_UPLOAD_CHUNK_SIZE` | `5242880` | TUS upload chunk size in bytes for direct Storyteller uploads. |
 | Ebook Cache Size | `EBOOK_CACHE_SIZE` | `3` | Parsed-ebook cache size. |
+
+For the ABS audio shortcut, mount the same underlying audiobook files at the
+same container paths in ABS and BookBridge. A path and size match cannot detect
+different files of the same size on unrelated mounts.
 
 ### Local ebook sources are confined to these directories
 

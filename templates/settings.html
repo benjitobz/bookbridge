@@ -1312,6 +1312,17 @@
                         </div>
                     </div>
 
+                    <!-- Separator -->
+                    <div class="full-width" style="margin: 10px 0; border-top: 1px solid rgba(255,255,255,0.1);"></div>
+                    <h4 class="full-width" style="font-size: 14px; color: #fff; margin-bottom: -10px;">Books You Start Reading</h4>
+
+                    <div class="checkbox-wrapper full-width">
+                        <input type="checkbox" id="bookorbit_reading_watch" name="BOOKORBIT_READING_WATCH_ENABLED"
+                            {% if get_bool('BOOKORBIT_READING_WATCH_ENABLED') %}checked{% endif %}>
+                        <label for="bookorbit_reading_watch">Auto-match books you start reading in BookOrbit</label>
+                    </div>
+                    <div class="help-text full-width">When you start reading a BookOrbit ebook the bridge hasn't matched yet (past 1%), it looks for the audiobook. A match is added to Suggestions for you to confirm; with no audiobook found, the book is added as ebook-only so its progress syncs.</div>
+
                     <!-- Annotation / highlight sync -->
                     <div class="full-width" style="margin: 10px 0; border-top: 1px solid rgba(255,255,255,0.1);"></div>
                     <h4 class="full-width" style="font-size: 14px; color: #fff; margin-bottom: -10px;">Highlight Sync</h4>
@@ -1348,14 +1359,13 @@
                         <label>Read-Along Audio Bitrate</label>
                         <input type="text" name="READALONG_AUDIO_BITRATE"
                             value="{{ get_val('READALONG_AUDIO_BITRATE', '32k') }}"
-                            placeholder="32k">
-                        <div class="help-text">Bitrate ffmpeg encodes into a generated read-along EPUB's embedded
-                            audio (mono AAC) — e.g. <code>32k</code>, <code>48k</code>. Spoken-word audio stays
-                            intelligible well below music bitrates; Storyteller's own read-along files run about
-                            31kbps. Lower saves storage and download size across the library (roughly 14MB per hour
-                            of audio at the default); higher improves quality at the cost of both. An invalid value
-                            falls back to the default rather than failing generation. Applies the next time a
-                            read-along EPUB is generated — existing generated files are not re-encoded.</div>
+                            placeholder="source or 32k">
+                        <div class="help-text">Use <code>source</code> for best quality: a single AAC LC audiobook
+                            keeps its original audio without re-encoding, including channels and sample rate.
+                            Other formats and multi-file audiobooks are encoded as 64 kbps mono AAC.
+                            A numeric bitrate, e.g. <code>32k</code> or <code>64k</code>, always encodes mono AAC;
+                            lower values save storage and download size (roughly 14MB per hour at the 32k default).
+                            An invalid value falls back to 32k. Regenerate existing read-alongs to apply a change.</div>
                     </div>
                 </div>
             </div>
@@ -1762,6 +1772,25 @@
                             only drops the claim of the user who removed it. Leave off if each user
                             curates their own library.
                         </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Series display -->
+            <div class="settings-section">
+                <div class="section-header">
+                    <h3>Series Display</h3>
+                </div>
+                <div class="section-body">
+                    <div class="checkbox-wrapper full-width">
+                        <input type="checkbox" id="series_show_current_book_detail"
+                            name="SERIES_SHOW_CURRENT_BOOK_DETAIL" {% if
+                            get_bool('SERIES_SHOW_CURRENT_BOOK_DETAIL') %}checked{% endif %}>
+                        <label for="series_show_current_book_detail">Show each series as the book you're
+                            reading</label>
+                        <div class="help-text">The series appears as the full card of the book you are on (the
+                            one in progress, or the next unfinished), with the series name, how many are finished
+                            and the other books listed at its bottom; click the series line to open the rest.</div>
                     </div>
                 </div>
             </div>
@@ -2666,6 +2695,7 @@
                     <div class="form-group">
                         <label>Audiobooks Dir</label>
                         <input type="text" name="AUDIOBOOKS_DIR" value="{{ get_val('AUDIOBOOKS_DIR') }}">
+                        <div class="help-text">If ABS and BookBridge mount the same audiobook files at the same paths, matching tracks are read here without another download.</div>
                     </div>
                 </div>
             </div>

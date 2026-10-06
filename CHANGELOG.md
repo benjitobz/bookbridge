@@ -4,6 +4,120 @@
 
 All notable changes to BookBridge will be documented in this file.
 
+## [7.9.0] - 2026-10-05
+
+### Added
+
+- **Books you start reading in BookOrbit get matched automatically.** Turn on
+  **Auto-match books you start reading in BookOrbit** on the BookOrbit card
+  (Settings → Integrations; off by default). Once you're past 1% of an ebook the
+  bridge hasn't matched, it looks for the audiobook: a match lands in Suggestions
+  for you to confirm, and a book with no audiobook is added as ebook-only so its
+  progress syncs.
+
+- **Show each series as the book you're reading (#449).** With **Show each series as
+  the book you're reading** on (Settings → Features → Series Display, off by
+  default), a series on the Library is one card: the full card of the book you are
+  on — the one in progress, or the next unread one — with the series name and
+  author, how many are finished and the other books listed along its bottom. Click
+  that strip to open the rest of the series below it. The card keeps that book's
+  per-service progress while the series is closed. Finished series keep their usual
+  card.
+
+### Changed
+
+- **Read-alongs can preserve the audiobook's audio quality.** Set Read-Along Audio
+  Bitrate to `source` to reuse a single AAC LC audiobook without another lossy
+  encode. Other formats and multi-file audiobooks use 64 kbps mono AAC. Numeric
+  bitrate choices and the 32k default remain available. Regenerate existing
+  read-alongs to apply the setting.
+
+- **Mounted Audiobookshelf audio avoids a duplicate download (#455).** If an ABS
+  track exists inside the configured Audiobooks Directory and its size matches
+  ABS metadata, BookBridge uses it for CTC or transcription. Unavailable or
+  mismatched tracks keep the existing download and stream fallback.
+
+- **StoryGraph defaults to page progress (#458).** When the matched edition has
+  a page count, BookBridge sends an estimated page and selects Pages in
+  StoryGraph. Books without a page count continue to sync by percentage. EPUB
+  and audiobook positions do not identify an exact print page.
+
+- **Library cards pack together instead of lining up in rows.** Each card keeps its
+  own height and the next one sits directly under it, so short cards no longer stretch
+  to match a tall neighbour and no gaps open up below them. Opening a series, or a
+  book's reading position, moves only the cards beneath it.
+
+### Fixed
+
+- **Hardcover and StoryGraph are no longer called every sync cycle for books they
+  can't update (#468).** When a tracker couldn't take a post (for example, a book
+  with no Hardcover match), BookBridge retried on every sync cycle, even with
+  nothing being read. One unmatched book could use hundreds of Hardcover API
+  requests a night. Failed posts now retry after 15 minutes, then wait twice as
+  long each time, up to every 6 hours. New reading progress still gets posted
+  after the usual cooldown. Hardcover also detects a re-read of a finished book
+  again: starting the book over opens a new read once you're 2% further in.
+
+- **Forced alignment no longer stalls on noisy FFmpeg decode errors (#467).**
+  QuartzNet streams audio while capturing decoder errors in a temporary file,
+  preventing a full stderr pipe from blocking the job. Decode failures retain
+  their error details. After updating and restarting, retry affected jobs;
+  existing reading progress needs no repair.
+
+- **CWA Kobo sync finds books whose audiobook title differs from Calibre's
+  (#462).** A CWA book could be skipped every cycle with "Could not unambiguously
+  resolve … to a single book" when its audiobook title carried a subtitle,
+  edition tag, "(Unabridged)" or a translated title that Calibre's catalog
+  title doesn't have. The bridge now also searches CWA for the title stored in
+  the ebook file itself and for the audiobook title without its decoration.
+  The exact Calibre book is still chosen by its id, so a broader search can't
+  bind progress to a different book.
+
+- **Russian and other non-Latin books are no longer refused by the Content-Match
+  Guard (#460).** The guard only recognised Latin letters, so a Russian book was
+  compared on its page numbers and stray markup and every correct pairing failed
+  at a few percent. It now reads words in any alphabet and ignores accent
+  differences such as `ё`/`е`. Chinese, Japanese and Thai, which don't put spaces
+  between words, are no longer judged by this check. English books score the
+  same or slightly higher than before.
+
+- **Built-in KoSync works with an empty server URL (#456).** When KoSync is
+  enabled, the sync client now connects to the built-in server on port 5757 (or
+  `KOSYNC_PORT` in split-port mode) without requiring a Settings page save or an
+  explicit `KOSYNC_SERVER`. Explicit external URLs still work.
+
+- **Add Book ebook cards show the full title.** Long titles now wrap instead of
+  hiding their ending, so volumes with the same opening words can be told apart
+  on a phone.
+
+- **Add Book finds editions whose titles differ only in punctuation.** A quoted
+  ebook title and its unquoted audiobook title now appear together when you
+  search for either spelling. Long-title searches use a short shared phrase
+  and check the full title before showing matches, so other volumes stay out
+  of a specific volume's results.
+
+- **CTC alignment can use Audiobookshelf audio (#455).** When forced alignment is
+  enabled, BookBridge now caches ABS tracks locally so CTC can read them. A failed
+  track download still leaves the stream available for transcription, and download
+  logs no longer expose the stream token.
+
+- **BridgeSync book downloads no longer time out on network-mounted libraries
+  (#454).** Books whose ebook the bridge fetched from Audiobookshelf were looked
+  for across the whole library twice before the bridge checked its own copy. On
+  an SMB/CIFS or NFS share that took longer than KOReader waits for a download
+  to start, so the downloads failed with `Request interrupted: wantread`. They
+  now start at once.
+
+- **Positions no longer jump back to near the start of some books.** In EPUBs
+  that put quotation marks in their own formatting, a position read from
+  KOReader, BookOrbit, Grimmory or the ABS reader could be matched to an
+  earlier line of dialogue — or to the title page — so the other apps were
+  sent to the wrong place (or the sync was skipped).
+
+- **Dismissed Up Next suggestions no longer come back after the daily re-scan.**
+  Once you dismiss a match suggestion, it stays dismissed — the periodic re-scan
+  used to resurrect it.
+
 ## [7.8.0] - 2026-09-25
 
 ### Added

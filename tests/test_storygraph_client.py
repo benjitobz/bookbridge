@@ -186,9 +186,13 @@ class TestStorygraphClient(unittest.TestCase):
 
     @patch("src.api.storygraph_client.requests.get")
     @patch("src.api.storygraph_client.requests.post")
-    def test_update_progress_posts_plugin_payload_to_endpoint(self, mock_post, mock_get):
+    def test_update_progress_defaults_to_pages_when_count_available(self, mock_post, mock_get):
         html = """
         <meta name="csrf-token" content="csrf123" />
+        <select class="read-status-progress-type">
+            <option value="percentage" selected="selected">Percentage</option>
+            <option value="pages">Pages</option>
+        </select>
         <input class="read-status-book-num-of-pages" value="321" />
         """
         mock_get.return_value = Mock(status_code=200, text=html, headers={})
@@ -201,8 +205,8 @@ class TestStorygraphClient(unittest.TestCase):
         self.assertEqual(
             mock_post.call_args.kwargs["data"],
             {
-                "read_status[progress_number]": "42",
-                "read_status[progress_type]": "percentage",
+                "read_status[progress_number]": "135",
+                "read_status[progress_type]": "pages",
                 "read_status[book_num_of_pages]": "321",
                 "book_id": "book-1",
                 "on_book_page": "true",
@@ -211,6 +215,44 @@ class TestStorygraphClient(unittest.TestCase):
         )
         self.assertEqual(mock_post.call_args.kwargs["headers"]["X-CSRF-Token"], "csrf123")
         self.assertFalse(mock_post.call_args.kwargs["allow_redirects"])
+
+    @patch("src.api.storygraph_client.requests.get")
+    @patch("src.api.storygraph_client.requests.post")
+    def test_update_progress_preserves_pages_selected_in_storygraph(self, mock_post, mock_get):
+        html = """
+        <meta name="csrf-token" content="csrf123" />
+        <select class="read-status-progress-type">
+            <option value="percentage">Percentage</option>
+            <option value="pages" selected="selected">Pages</option>
+        </select>
+        <input class="read-status-book-num-of-pages" value="321" />
+        """
+        mock_get.return_value = Mock(status_code=200, text=html, headers={})
+        mock_post.return_value = Mock(status_code=200, headers={})
+
+        self.assertTrue(self.client.update_progress("book-1", 0.424))
+        payload = mock_post.call_args.kwargs["data"]
+        self.assertEqual(payload["read_status[progress_type]"], "pages")
+        self.assertEqual(payload["read_status[progress_number]"], "136")
+        self.assertEqual(payload["read_status[book_num_of_pages]"], "321")
+
+    @patch("src.api.storygraph_client.requests.get")
+    @patch("src.api.storygraph_client.requests.post")
+    def test_update_progress_uses_percentage_when_pages_have_no_count(self, mock_post, mock_get):
+        html = """
+        <meta name="csrf-token" content="csrf123" />
+        <select class="read-status-progress-type">
+            <option value="pages" selected="selected">Pages</option>
+        </select>
+        <input class="read-status-book-num-of-pages" value="0" />
+        """
+        mock_get.return_value = Mock(status_code=200, text=html, headers={})
+        mock_post.return_value = Mock(status_code=200, headers={})
+
+        self.assertTrue(self.client.update_progress("book-1", 0.42))
+        payload = mock_post.call_args.kwargs["data"]
+        self.assertEqual(payload["read_status[progress_type]"], "percentage")
+        self.assertEqual(payload["read_status[progress_number]"], "42")
 
     def test_extract_book_id_from_input_url(self):
         # Direct URL

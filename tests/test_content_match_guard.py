@@ -76,7 +76,7 @@ def test_overlap_identical_text_scores_near_one():
 
 
 def test_overlap_survives_an_inline_word_join_in_the_ebook_text():
-    """``_WORD_TOKEN_RE`` (``[a-z0-9']+``) does not include
+    """``_WORD_TOKEN_RE`` does not include
     ``INLINE_TEXT_JOINER``, so left in place it would split a bionic-reading
     mid-word join (e.g. ``"th<JOINER>e"``) back into two separate tokens
     ("th", "e") that never match the transcript's single "the" token --
@@ -364,3 +364,113 @@ def test_guard_allows_the_lowest_real_world_overlap_and_refuses_near_zero(servic
         assert service._verify_content_match(
             [{"start": 0.0, "end": 1.0, "text": unrelated}], ebook_text, abs_id="zero"
         ) is False
+
+
+# --------------------------------------------------------------------------- #
+# Non-Latin scripts (issue #460). The tokenizer used to be `[a-z0-9']+`, so a
+# Russian book tokenized to just its page numbers, years and `&gt;` remnants --
+# enough tokens to pass the size floor, none of them in the transcript -- and
+# every correct Russian pairing was refused at 3-7% overlap.
+# --------------------------------------------------------------------------- #
+
+_CYRILLIC = "абвгдежзиклмнопрстуфхцчшщэюя"
+
+
+def _russian_words(count: int, start: int = 0) -> List[str]:
+    """`count` distinct Cyrillic-only words (no digits), like `_sequential_words`."""
+    words = []
+    for i in range(start, start + count):
+        n, word = i + 1, "сл"
+        while n:
+            word += _CYRILLIC[n % len(_CYRILLIC)]
+            n //= len(_CYRILLIC)
+        words.append(word)
+    return words
+
+
+def _russian_pair(count: int = 3000, transcript_start: int = 0):
+    """(transcript, ebook) shaped like the #460 report: the ebook carries page
+    numbers every 25 words and stray `&gt;` markup; both narrate the year 1984."""
+    transcript, ebook = [], []
+    for i, word in enumerate(_russian_words(count)):
+        ebook.append(word)
+        if i % 40 == 0:
+            ebook.append("1984")
+        if i % 25 == 0:
+            ebook.append(str(i // 25))
+        if i % 300 == 0:
+            ebook.append("&gt;")
+    for i, word in enumerate(_russian_words(count, start=transcript_start)):
+        transcript.append(word)
+        if i % 40 == 0:
+            transcript.append("1984")
+    return " ".join(transcript), " ".join(ebook)
+
+
+def test_russian_pairing_is_not_refused_by_the_lexical_guard(service, caplog):
+    """#460 regression: a correct Russian pairing scored 0.0 (the report saw
+    3.5-7%) and logged `Lexical content-match guard: audio/ebook n-gram overlap
+    too low`. It must now clear the shipped default and store the map."""
+    from src.utils.config_loader import DEFAULT_CONFIG
+
+    transcript_text, ebook_text = _russian_pair()
+    assert transcript_text_overlap(transcript_text, ebook_text) >= 0.5
+
+    segments = [{"start": 0.0, "end": 3000.0, "text": transcript_text}]
+    with pytest.MonkeyPatch.context() as mp:
+        _guard_env(mp, min_overlap=DEFAULT_CONFIG["CONTENT_MATCH_MIN_OVERLAP"])
+        with caplog.at_level("WARNING"):
+            ok = service._verify_content_match(segments, ebook_text, abs_id="768ec688")
+
+    assert ok is True
+    assert "Lexical content-match guard: audio/ebook n-gram overlap too low" not in caplog.text
+
+
+def test_unrelated_russian_transcript_is_still_refused():
+    """The guard must keep working for Russian, not just stop blocking it."""
+    _, ebook_text = _russian_pair()
+    unrelated, _ = _russian_pair(transcript_start=500_000)
+    assert transcript_text_overlap(unrelated, ebook_text) == pytest.approx(0.0, abs=0.02)
+
+
+def test_cyrillic_words_tokenize_and_yo_folds_to_ye():
+    assert map_quality._word_tokens("Тана Френч, «В лесу» — ещё 1984 &gt;") == [
+        "тана", "френч", "в", "лесу", "еще", "1984", "gt",
+    ]
+    assert map_quality._word_tokens("Ещё") == map_quality._word_tokens("еще")
+
+
+def test_accents_and_curly_apostrophes_do_not_split_matches():
+    assert map_quality._word_tokens("Café l’homme don’t") == ["cafe", "l'homme", "don't"]
+
+
+def test_ascii_tokens_match_the_calibrated_pattern():
+    """The 28-pair calibration was measured with `[a-z0-9']+`; plain ASCII text
+    must tokenize exactly as it did then so those numbers still hold."""
+    import re
+
+    text = "It's 1984, Winston -- 'tis the_end o' the day; rock'n'roll? Dogs' bowls!"
+    assert map_quality._word_tokens(text) == re.findall(r"[a-z0-9']+", text.lower())
+
+
+def test_digit_only_tokens_cannot_judge():
+    """Tokens with no letters (page numbers, years) never make a text judgeable."""
+    ebook = " ".join(str(i) for i in range(300))
+    transcript = " ".join(str(i) for i in range(1000, 1300))
+    assert transcript_text_overlap(transcript, ebook) == 1.0
+
+
+def test_unspaced_script_cannot_judge():
+    """Chinese/Japanese/Thai have no spaces between words, so word n-grams can't
+    line up with ASR output -- return 'cannot judge' instead of refusing."""
+    ebook = "。".join(f"我们站在门口默默地看着第{i}片森林" for i in range(200))
+    transcript = " ".join(f"他们在路上走了很久第{i}天" for i in range(200))
+    assert transcript_text_overlap(transcript, ebook) == 1.0
+
+
+def test_closing_curly_quote_stays_a_separator():
+    """A word-edge `’` is a closing single quote, not an apostrophe: straightening
+    it would glue it onto the word ("hello'") and miss the transcript's "hello"."""
+    assert map_quality._word_tokens("‘Hello,’ she said. ‘Don’t.’") == [
+        "hello", "she", "said", "don't",
+    ]

@@ -304,6 +304,7 @@ class Container(containers.DeclarativeContainer):
     abs_audio_source_adapter = providers.Singleton(
         ABSAudioSourceAdapter,
         abs_client=abs_client,
+        data_dir=data_dir,
     )
 
     booklore_audio_source_adapter = providers.Singleton(

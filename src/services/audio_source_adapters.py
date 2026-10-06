@@ -9,6 +9,7 @@ from typing import Optional
 from src.api.api_clients import ABSClient
 from src.api.booklore_client import BookloreClient
 from src.api.bookorbit_client import BookOrbitClient
+from src.utils.config_loader import env_truthy
 from src.utils.logging_utils import sanitize_log_data
 
 logger = logging.getLogger(__name__)
@@ -87,8 +88,9 @@ class AudioSourceAdapter:
 class ABSAudioSourceAdapter(AudioSourceAdapter):
     source_name = "ABS"
 
-    def __init__(self, abs_client: ABSClient):
+    def __init__(self, abs_client: ABSClient, data_dir: Path | None = None):
         self.abs_client = abs_client
+        self.data_dir = Path(data_dir) if data_dir is not None else None
 
     @staticmethod
     def _parse_library_scope() -> str | None:
@@ -239,7 +241,29 @@ class ABSAudioSourceAdapter(AudioSourceAdapter):
         return f"/api/cover-proxy/{source_id}"
 
     def get_audio_files(self, source_id: str, bridge_key: str | None = None) -> list[dict]:
-        return self.abs_client.get_audio_files(source_id)
+        files = [dict(audio_file) for audio_file in (self.abs_client.get_audio_files(source_id) or [])]
+        if not files or self.data_dir is None or not env_truthy("CTC_ENABLED"):
+            return files
+
+        cache_key = str(bridge_key or source_id).replace(":", "_")
+        source_cache_dir = self.data_dir / "audio_cache" / cache_key / "source_tracks"
+        for idx, audio_file in enumerate(files):
+            if audio_file.get("local_path"):
+                continue
+            ext = str(audio_file.get("ext") or "mp3").lower().lstrip(".")
+            if not ext.isalnum():
+                ext = "mp3"
+            local_path = source_cache_dir / f"track_{idx:03d}.{ext}"
+            if not local_path.exists() or local_path.stat().st_size == 0:
+                source_cache_dir.mkdir(parents=True, exist_ok=True)
+                if not self.abs_client.download_file(audio_file["stream_url"], local_path):
+                    logger.warning(
+                        "ABS track download failed for item_id=%s track_index=%s; using stream for transcription",
+                        source_id, idx,
+                    )
+                    continue
+            audio_file["local_path"] = str(local_path)
+        return files
 
     def get_chapters(self, source_id: str) -> list[dict]:
         details = self.get_metadata(source_id) or {}

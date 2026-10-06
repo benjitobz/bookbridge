@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.db.models import Book
+from src.services.audio_source_adapters import ABSAudioSourceAdapter
 from src.sync_manager import SyncManager
 from src.utils.transcription_cancel import register_worker
 from src.utils.transcriber import TranscriptionCancelled
@@ -341,6 +342,36 @@ def test_new_book_upgrades_to_ctc_after_transcription(tmp_path, monkeypatch):
     assert alignment_service.align_forced_and_store.call_count == 2   # first attempt + upgrade
     transcriber.process_audio.assert_called_once()
     assert book.transcript_source == "ctc"
+
+
+def test_abs_book_reaches_ctc_without_the_reported_local_audio_fallback(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("CTC_ENABLED", "true")
+    manager, _db, abs_client, transcriber, alignment_service = _build_manager(tmp_path)
+    abs_client.get_audio_files.return_value = [
+        {"stream_url": "http://abs.example/track?token=secret", "ext": "m4b"}
+    ]
+
+    def download(_url, destination):
+        Path(destination).write_bytes(b"audio" * 300)
+        return True
+
+    abs_client.download_file.side_effect = download
+    manager.audio_source_adapters = {"ABS": ABSAudioSourceAdapter(abs_client, tmp_path)}
+    alignment_service.align_forced_and_store.return_value = True
+    book = Book(
+        abs_id="abs-455", abs_title="ABS Audio", ebook_filename="book.epub",
+        kosync_doc_id="h", status="pending", duration=12.0,
+        audio_source="ABS", audio_source_id="item-455", sync_mode="audiobook",
+    )
+
+    with caplog.at_level(logging.INFO, logger="src.sync_manager"):
+        manager._run_background_job(book)
+
+    assert "CTC enabled but audio for 'abs-455' is not fully local; using SMIL/Whisper" not in caplog.text
+    assert "CTC forced-alignment map generated for 'ABS Audio'" in caplog.text
+    assert book.transcript_source == "ctc"
+    transcriber.process_audio.assert_not_called()
+    alignment_service.align_forced_and_store.assert_called_once()
 
 
 # --------------------------------------------------------------------------- #
