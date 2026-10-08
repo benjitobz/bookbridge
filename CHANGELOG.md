@@ -23,6 +23,9 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- KOReader copies downloaded from CWA sync on first open. CWA embeds metadata on
+  download, so the device's hash differs from the matched file; BookBridge now looks
+  unknown hashes up in CWA's checksum history when `CALIBRE_LIBRARY_PATH` is set (#302).
 - CWA search and UUID lookup tolerate bare HTML line breaks in Calibre-Web's
   XHTML review content while retaining strict metadata and XML security checks (#477).
 - Malformed shelf membership and filter data no longer appears as a valid empty
