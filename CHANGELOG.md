@@ -23,6 +23,10 @@ All notable changes to BookBridge will be documented in this file.
 
 ### Fixed
 
+- BookFusion uploads link the reader API ID used by progress endpoints, including
+  EPUBs without author metadata. Existing invalid links can be repaired with
+  `scripts/repair_bookfusion_user_api_ids.py --user-id USER --abs-id BOOK`;
+  add `--apply` to save changes (#478, #480).
 - KOReader copies downloaded from CWA sync on first open. CWA embeds metadata on
   download, so the device's hash differs from the matched file; BookBridge now looks
   unknown hashes up in CWA's checksum history when `CALIBRE_LIBRARY_PATH` is set (#302).

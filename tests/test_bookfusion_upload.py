@@ -643,6 +643,28 @@ class ApiBookfusionUploadRouteUnitTest(unittest.TestCase):
         self.assertEqual(sleep.call_count, 2)
         self.assertEqual(self._ws.uc.return_value.bookfusion_client.search_books.call_count, 3)
 
+    def test_created_authorless_epub_links_by_exact_reader_id(self):
+        with patch.object(self._ws, "extract_epub_metadata", return_value={
+            "title": "Route Test Book", "authors": [],
+        }):
+            result = self._run_route(reader_search_results=[{
+                "id": 10456, "title": "Route Test Book", "authors": [],
+                "read_url": "https://reader.bookfusion.com/books/456-route-test-book",
+            }])
+        self.assertTrue(result.json["success"])
+        self.assertEqual(self.saved_link_kwargs["bookfusion_id"], "10456")
+
+    def test_created_authorless_epub_rejects_another_reader_id(self):
+        with patch.object(self._ws, "extract_epub_metadata", return_value={
+            "title": "Route Test Book", "authors": [],
+        }), patch.object(self._ws.time, "sleep"):
+            result = self._run_route(reader_search_results=[{
+                "id": 10457, "title": "Route Test Book", "authors": [],
+                "read_url": "https://reader.bookfusion.com/books/457-route-test-book",
+            }])
+        self.assertEqual(result[1], 502)
+        self.assertEqual(self.saved_link_kwargs, {})
+
     # ------------------------------------------------------------------
     # ReadAloud variant tests (§7)
     # ------------------------------------------------------------------

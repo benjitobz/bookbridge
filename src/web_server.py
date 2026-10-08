@@ -12885,10 +12885,10 @@ def _resolve_created_bookfusion_id(calibre_book_id: int | None, title: str, auth
 
     The Calibre finalize endpoint returns the id embedded in ``read_url`` rather
     than the User API's ``id``. Search is retried briefly because uploads are
-    indexed asynchronously; no link is saved until the exact title/author match
-    also exposes that returned reader id.
+    indexed asynchronously; no link is saved until the exact title match (and
+    author, when supplied) also exposes that returned reader id.
     """
-    if calibre_book_id is None or not title or not author:
+    if calibre_book_id is None or not title:
         return None
     reader_client = uc().bookfusion_client
     if not reader_client.is_configured():
