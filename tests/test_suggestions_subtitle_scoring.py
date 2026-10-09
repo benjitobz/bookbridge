@@ -1,10 +1,12 @@
 import os
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+import src.web_server as web_server
+from src.services.audio_source_adapters import AudioResult
 from src.services.suggestions_service import SuggestionsService
 
 FULL = "Clearing the Air: A Hopeful Guide to Solving Climate Change in 50 Questions and Answers"
@@ -67,3 +69,15 @@ def test_both_titles_with_subtitles_are_not_stripped():
 def test_bare_series_title_never_auto_matches_a_volume():
     result = _scan(_service(), _abs_item("Mistborn"), "Mistborn: The Final Empire", "Mistborn: The Well of Ascension")
     assert all(m["score"] <= SuggestionsService._SUBTITLE_STRIPPED_SCORE_CAP for m in result["matches"])
+
+
+def test_scan_records_carry_the_abs_subtitle_into_scoring():
+    item = AudioResult(source="ABS", source_id="abs-1", title="Clearing the Air",
+                       subtitle=FULL.split(": ", 1)[1], authors="Hannah Ritchie")
+    with patch.object(web_server, "get_searchable_audiobooks", return_value=[item]), \
+            patch.object(web_server, "_browser_cover_url", return_value=""):
+        records = web_server.get_suggestion_audiobooks()
+
+    assert records[0]["audio_subtitle"] == FULL.split(": ", 1)[1]
+    result = _scan(_service(), records[0], FULL)
+    assert result["matches"][0]["score"] == 100.0

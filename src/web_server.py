@@ -3338,6 +3338,7 @@ def get_suggestion_audiobooks():
                 "audio_source": audio_source,
                 "audio_source_id": source_id,
                 "audio_title": title,
+                "audio_subtitle": (item.subtitle or "").strip(),
                 "audio_author": author,
                 "audio_language": item.language or "",
                 "audio_duration": item.duration,
@@ -8111,8 +8112,115 @@ def _prune_suggestions_scan_jobs():
             SUGGESTIONS_SCAN_JOBS.pop(job_id, None)
 
 
-_SUGGESTIONS_AUTO_SCAN_STATE = {"last_incremental": 0.0, "last_full_date": None}
+_SUGGESTIONS_AUTO_SCAN_STATE = {"last_incremental": 0.0, "last_full_date": None, "last_full_fire": None}
 _SUGGESTIONS_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+
+_CRON_FIELDS = (
+    (0, 59, {}),
+    (0, 23, {}),
+    (1, 31, {}),
+    (1, 12, {name: i for i, name in enumerate(
+        ('jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'), start=1)}),
+    (0, 7, {name: i for i, name in enumerate(('sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'))}),
+)
+
+
+def parse_cron_expression(expression: str):
+    """Parse a five-field cron expression into the set of values each field allows.
+
+    Supports `*`, numbers, `a-b` ranges, `/step`, comma lists and three-letter month and
+    weekday names. Day of week accepts 0-7, where 0 and 7 are both Sunday. Raises
+    ValueError for anything else.
+    """
+    fields = expression.split()
+    if len(fields) != 5:
+        raise ValueError(f"expected 5 fields, got {len(fields)}")
+    allowed = []
+    for text, (low, high, names) in zip(fields, _CRON_FIELDS):
+        values = set()
+        for part in text.lower().split(','):
+            span, _, step = part.partition('/')
+            if span == '*':
+                start, end = low, high
+            else:
+                first, _, last = span.partition('-')
+                start = names[first] if first in names else int(first)
+                end = (names[last] if last in names else int(last)) if last else (high if step else start)
+            stride = int(step) if step else 1
+            if not low <= start <= end <= high or stride < 1:
+                raise ValueError(f"'{part}' is outside {low}-{high}")
+            values.update(range(start, end + 1, stride))
+        allowed.append(values)
+    if 7 in allowed[4]:
+        allowed[4].add(0)
+    return allowed, fields[2] != '*', fields[4] != '*'
+
+
+def cron_matches(cron, when) -> bool:
+    """Whether a parsed cron expression fires at `when`, to the minute.
+
+    As in standard cron, when both day of month and day of week are restricted, a day
+    matching either one fires.
+    """
+    (minutes, hours, days, months, weekdays), day_restricted, weekday_restricted = cron
+    if when.minute not in minutes or when.hour not in hours or when.month not in months:
+        return False
+    day_ok = when.day in days
+    weekday_ok = when.isoweekday() % 7 in weekdays
+    if day_restricted and weekday_restricted:
+        return day_ok or weekday_ok
+    return day_ok and weekday_ok
+
+
+def _suggestions_full_refresh_schedule():
+    expression = (os.environ.get('SUGGESTIONS_FULL_REFRESH_CRON') or '').strip()
+    if expression:
+        return 'SUGGESTIONS_FULL_REFRESH_CRON', expression
+    day = (os.environ.get('SUGGESTIONS_FULL_REFRESH_DAY') or 'off').strip().lower()
+    if day not in _SUGGESTIONS_WEEKDAYS:
+        return None, None
+    raw_time = (os.environ.get('SUGGESTIONS_FULL_REFRESH_TIME') or '04:00').strip()
+    try:
+        refresh_time = datetime.strptime(raw_time, '%H:%M').time()
+    except ValueError:
+        return 'SUGGESTIONS_FULL_REFRESH_TIME', raw_time
+    return 'SUGGESTIONS_FULL_REFRESH_DAY', f"{refresh_time.minute} {refresh_time.hour} * * {day[:3]}"
+
+
+def _suggestions_full_refresh_due(now, state) -> Optional[str]:
+    """The cron fire a full refresh is owed for, as an ISO string, or None.
+
+    The latest fire within the past day stays owed until a refresh has run for it, so a
+    fire missed while BookBridge was down still runs once it is back.
+    """
+    source, expression = _suggestions_full_refresh_schedule()
+    if not expression:
+        return None
+    try:
+        cron = parse_cron_expression(expression)
+    except ValueError:
+        get_persistent_condition_logger().warn(
+            logger,
+            "suggestions-full-refresh-schedule",
+            "⚠️ %s '%s' is not a valid schedule — full refresh is off",
+            source,
+            sanitize_log_data(expression),
+            exc_info=True,
+        )
+        return None
+    get_persistent_condition_logger().resolve(
+        logger, "suggestions-full-refresh-schedule", "Full refresh schedule is valid again",
+    )
+    fire = now.replace(second=0, microsecond=0)
+    for _ in range(24 * 60 + 1):
+        if cron_matches(cron, fire):
+            if state.get("last_full_fire") == fire.isoformat() \
+                    or state.get("last_full_date") == fire.date().isoformat():
+                return None
+            return fire.isoformat()
+        fire -= timedelta(minutes=1)
+    return None
 
 
 def _suggestions_scan_running() -> bool:
@@ -8123,19 +8231,15 @@ def _suggestions_scan_running() -> bool:
 def _suggestions_auto_scan_due(now=None, state=None):
     """What the scan schedule owes right now: 'full', 'incremental' or None.
 
-    The interval and the weekly full refresh are read from the live settings on
-    every call, so changing them in Settings takes effect without a restart. The
-    full refresh runs once on its day, at or after its time.
+    The interval and the full refresh schedule are read from the live settings on
+    every call, so changing them in Settings takes effect without a restart.
     """
     if not env_truthy('SUGGESTIONS_ENABLED'):
         return None
     now = now or datetime.now()
     state = _SUGGESTIONS_AUTO_SCAN_STATE if state is None else state
 
-    day = (os.environ.get('SUGGESTIONS_FULL_REFRESH_DAY') or 'off').strip().lower()
-    at = (os.environ.get('SUGGESTIONS_FULL_REFRESH_TIME') or '04:00').strip()
-    if day in _SUGGESTIONS_WEEKDAYS and now.strftime('%A').lower() == day \
-            and now.strftime('%H:%M') >= at and state.get("last_full_date") != now.date().isoformat():
+    if _suggestions_full_refresh_due(now, state):
         return 'full'
 
     try:
@@ -8199,10 +8303,11 @@ def _suggestions_auto_scan_tick():
         if _suggestions_scan_running():
             return
         now = datetime.now()
+        full_fire = _suggestions_full_refresh_due(now, _SUGGESTIONS_AUTO_SCAN_STATE) if due == 'full' else None
         _run_scheduled_suggestions_scan(full=(due == 'full'))
         _SUGGESTIONS_AUTO_SCAN_STATE["last_incremental"] = now.timestamp()
-        if due == 'full':
-            _SUGGESTIONS_AUTO_SCAN_STATE["last_full_date"] = now.date().isoformat()
+        if full_fire:
+            _SUGGESTIONS_AUTO_SCAN_STATE["last_full_fire"] = full_fire
         logger.info("🔎 Scheduled suggestions scan started (%s)", due)
     except Exception as e:
         logger.warning("Scheduled suggestions scan could not start: %s", e, exc_info=True)

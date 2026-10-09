@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import src.web_server as web_server
 
-KEYS = ("SUGGESTIONS_ENABLED", "SUGGESTIONS_AUTO_SCAN_MINUTES",
+KEYS = ("SUGGESTIONS_ENABLED", "SUGGESTIONS_AUTO_SCAN_MINUTES", "SUGGESTIONS_FULL_REFRESH_CRON",
         "SUGGESTIONS_FULL_REFRESH_DAY", "SUGGESTIONS_FULL_REFRESH_TIME")
 
 
@@ -69,6 +69,56 @@ class TestDue(ScheduledScanTestCase):
         os.environ["SUGGESTIONS_FULL_REFRESH_DAY"] = "sunday"
         os.environ["SUGGESTIONS_FULL_REFRESH_TIME"] = "04:20"
         self.assertEqual("full", web_server._suggestions_auto_scan_due(datetime(2026, 9, 27, 4, 30), self.state))
+
+
+class TestCronSchedule(ScheduledScanTestCase):
+    def fires(self, expression, when):
+        return web_server.cron_matches(web_server.parse_cron_expression(expression), when)
+
+    def test_fields_ranges_steps_lists_and_names(self):
+        self.assertTrue(self.fires("*/15 9-17 * * mon-fri", datetime(2026, 9, 21, 9, 45)))
+        self.assertFalse(self.fires("*/15 9-17 * * mon-fri", datetime(2026, 9, 27, 9, 45)))
+        self.assertTrue(self.fires("0 2 1,15 * *", datetime(2026, 9, 15, 2, 0)))
+        self.assertTrue(self.fires("0 4 * * 7", datetime(2026, 9, 27, 4, 0)))
+        self.assertTrue(self.fires("0 4 1 * sun", datetime(2026, 10, 1, 4, 0)))
+
+    def test_invalid_expressions_raise(self):
+        for expression in ("* * * *", "60 * * * *", "*/0 * * * *", "0 4 * * funday"):
+            with self.subTest(expression=expression):
+                with self.assertRaises(ValueError):
+                    web_server.parse_cron_expression(expression)
+
+    def test_cron_runs_every_fire_once(self):
+        os.environ["SUGGESTIONS_FULL_REFRESH_CRON"] = "0 3 * * *"
+        self.state["last_full_fire"] = "2026-09-20T03:00:00"
+        self.assertIsNone(web_server._suggestions_auto_scan_due(datetime(2026, 9, 21, 2, 59), self.state))
+        self.assertEqual("full", web_server._suggestions_auto_scan_due(datetime(2026, 9, 21, 3, 0), self.state))
+        self.state["last_full_fire"] = "2026-09-21T03:00:00"
+        self.assertIsNone(web_server._suggestions_auto_scan_due(datetime(2026, 9, 21, 9, 0), self.state))
+
+    def test_cron_overrides_the_weekly_day(self):
+        os.environ["SUGGESTIONS_FULL_REFRESH_CRON"] = "0 3 * * *"
+        os.environ["SUGGESTIONS_FULL_REFRESH_DAY"] = "sunday"
+        self.assertEqual("full", web_server._suggestions_auto_scan_due(datetime(2026, 9, 22, 3, 0), self.state))
+
+    def test_tick_records_the_fire_it_served(self):
+        os.environ["SUGGESTIONS_FULL_REFRESH_CRON"] = "0 3 * * *"
+        saved = dict(web_server._SUGGESTIONS_AUTO_SCAN_STATE)
+        self.addCleanup(web_server._SUGGESTIONS_AUTO_SCAN_STATE.update, saved)
+        web_server._SUGGESTIONS_AUTO_SCAN_STATE.update(last_full_fire=None, last_full_date=None)
+        fake_now = datetime(2026, 9, 22, 3, 5)
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fake_now
+
+        with patch.object(web_server, "datetime", Clock), \
+                patch.object(web_server, "_suggestions_scan_running", return_value=False), \
+                patch.object(web_server, "_run_scheduled_suggestions_scan", return_value="job") as run:
+            web_server._suggestions_auto_scan_tick()
+        run.assert_called_once_with(full=True)
+        self.assertEqual("2026-09-22T03:00:00", web_server._SUGGESTIONS_AUTO_SCAN_STATE["last_full_fire"])
 
 
 class TestTick(ScheduledScanTestCase):

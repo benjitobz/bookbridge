@@ -553,8 +553,8 @@ Enabled under **Settings -> Features**. The Suggestions page is a review workspa
 | --- | --- | --- | --- |
 | Enable Suggestions | `SUGGESTIONS_ENABLED` | `false` | Enables the Suggestions page and background suggestion discovery. |
 | Scheduled Scan Interval | `SUGGESTIONS_AUTO_SCAN_MINUTES` | `0` | Minutes between scheduled library scans (0 = off). Runs as the primary admin, reusing cached results like a normal scan. |
-| Weekly Full Refresh Day | `SUGGESTIONS_FULL_REFRESH_DAY` | `off` | `off` or a weekday. Once a week the scan cache is cleared and the whole unmatched library is rescanned. |
-| Weekly Full Refresh Time | `SUGGESTIONS_FULL_REFRESH_TIME` | `04:00` | Local time (HH:MM) at or after which the weekly full refresh runs. |
+| Full Refresh Schedule | `SUGGESTIONS_FULL_REFRESH_CRON` | _(empty)_ | Five-field cron expression (minute hour day-of-month month day-of-week, in the `TZ` timezone; `*`, ranges, steps, lists and `jan`/`sun`-style names). Each time it fires the scan cache is cleared and the whole unmatched library is rescanned. A fire missed while BookBridge was down runs when it comes back, up to a day late. Empty = off; an invalid expression turns it off and logs a warning. |
+| Weekly Full Refresh Day / Time | `SUGGESTIONS_FULL_REFRESH_DAY` / `SUGGESTIONS_FULL_REFRESH_TIME` | `off` / `04:00` | Legacy weekly schedule, used only while `SUGGESTIONS_FULL_REFRESH_CRON` is empty (`sunday` + `04:20` behaves like `20 4 * * sun`). Saving the Features page converts it to the cron setting. |
 
 Suggestions notes:
 
