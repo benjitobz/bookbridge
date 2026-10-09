@@ -248,6 +248,30 @@ class TestSettingsComprehensive(unittest.TestCase):
         self.assertIn('<option value="tiny"></option>', html)
         self.assertIn('<option value="large-v3"></option>', html)
 
+    def test_full_refresh_cron_is_prefilled_from_the_weekly_schedule(self):
+        legacy = {'SUGGESTIONS_FULL_REFRESH_CRON': '', 'SUGGESTIONS_FULL_REFRESH_DAY': 'sunday',
+                  'SUGGESTIONS_FULL_REFRESH_TIME': '04:20'}
+        with patch.dict(os.environ, legacy, clear=False):
+            html = self._render_settings_template_source()
+        self.assertIn('value="20 4 * * sun"', html)
+        self.assertIn('<input type="hidden" name="SUGGESTIONS_FULL_REFRESH_DAY" value="off">', html)
+
+        with patch.dict(os.environ, {**legacy, 'SUGGESTIONS_FULL_REFRESH_CRON': '0 3 * * *'}, clear=False):
+            html = self._render_settings_template_source()
+        self.assertIn('value="0 3 * * *"', html)
+
+    @patch('src.web_server.restart_server')
+    def test_saving_the_cron_retires_the_weekly_day(self, _mock_restart):
+        self.settings_store.update(SUGGESTIONS_FULL_REFRESH_DAY='sunday', SUGGESTIONS_FULL_REFRESH_TIME='04:20')
+        response = self.client.post('/settings', data={
+            'SYNC_PERIOD_MINS': '5',
+            'SUGGESTIONS_FULL_REFRESH_CRON': '0 3 * * *',
+            'SUGGESTIONS_FULL_REFRESH_DAY': 'off',
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual('0 3 * * *', self.settings_store['SUGGESTIONS_FULL_REFRESH_CRON'])
+        self.assertEqual('off', self.settings_store['SUGGESTIONS_FULL_REFRESH_DAY'])
+
     def test_settings_get_moves_account_credentials_to_per_user(self):
         html = self._render_settings_template_source()
 
