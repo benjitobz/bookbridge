@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import src.web_server as web_server
 
 KEYS = ("SUGGESTIONS_ENABLED", "SUGGESTIONS_AUTO_SCAN_MINUTES", "SUGGESTIONS_FULL_REFRESH_CRON",
+        "SUGGESTIONS_FULL_REFRESH_ENABLED",
         "SUGGESTIONS_FULL_REFRESH_DAY", "SUGGESTIONS_FULL_REFRESH_TIME")
 
 
@@ -89,6 +90,7 @@ class TestCronSchedule(ScheduledScanTestCase):
                     web_server.parse_cron_expression(expression)
 
     def test_cron_runs_every_fire_once(self):
+        os.environ["SUGGESTIONS_FULL_REFRESH_ENABLED"] = "true"
         os.environ["SUGGESTIONS_FULL_REFRESH_CRON"] = "0 3 * * *"
         self.state["last_full_fire"] = "2026-09-20T03:00:00"
         self.assertIsNone(web_server._suggestions_auto_scan_due(datetime(2026, 9, 21, 2, 59), self.state))
@@ -96,12 +98,21 @@ class TestCronSchedule(ScheduledScanTestCase):
         self.state["last_full_fire"] = "2026-09-21T03:00:00"
         self.assertIsNone(web_server._suggestions_auto_scan_due(datetime(2026, 9, 21, 9, 0), self.state))
 
+    def test_cron_is_off_until_enabled(self):
+        os.environ["SUGGESTIONS_FULL_REFRESH_CRON"] = "0 3 * * *"
+        self.assertIsNone(web_server._suggestions_auto_scan_due(datetime(2026, 9, 22, 3, 0), self.state))
+        os.environ["SUGGESTIONS_FULL_REFRESH_ENABLED"] = "true"
+        os.environ["SUGGESTIONS_FULL_REFRESH_CRON"] = ""
+        self.assertIsNone(web_server._suggestions_auto_scan_due(datetime(2026, 9, 22, 3, 0), self.state))
+
     def test_cron_overrides_the_weekly_day(self):
+        os.environ["SUGGESTIONS_FULL_REFRESH_ENABLED"] = "true"
         os.environ["SUGGESTIONS_FULL_REFRESH_CRON"] = "0 3 * * *"
         os.environ["SUGGESTIONS_FULL_REFRESH_DAY"] = "sunday"
         self.assertEqual("full", web_server._suggestions_auto_scan_due(datetime(2026, 9, 22, 3, 0), self.state))
 
     def test_tick_records_the_fire_it_served(self):
+        os.environ["SUGGESTIONS_FULL_REFRESH_ENABLED"] = "true"
         os.environ["SUGGESTIONS_FULL_REFRESH_CRON"] = "0 3 * * *"
         saved = dict(web_server._SUGGESTIONS_AUTO_SCAN_STATE)
         self.addCleanup(web_server._SUGGESTIONS_AUTO_SCAN_STATE.update, saved)

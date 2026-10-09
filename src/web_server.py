@@ -4348,6 +4348,7 @@ def settings():
             'TELEGRAM_ENABLED',
             'SUGGESTIONS_ENABLED',
             'SUGGESTIONS_AUTO_MATCH_ENABLED',
+            'SUGGESTIONS_FULL_REFRESH_ENABLED',
             'ABS_ONLY_SEARCH_IN_ABS_LIBRARY_ID',
             'ABS_COLLECTION_RECONCILE',
             'REPROCESS_ON_CLEAR_IF_NO_ALIGNMENT',
@@ -8174,9 +8175,9 @@ def cron_matches(cron, when) -> bool:
 
 
 def _suggestions_full_refresh_schedule():
-    expression = (os.environ.get('SUGGESTIONS_FULL_REFRESH_CRON') or '').strip()
-    if expression:
-        return 'SUGGESTIONS_FULL_REFRESH_CRON', expression
+    if env_truthy('SUGGESTIONS_FULL_REFRESH_ENABLED'):
+        expression = (os.environ.get('SUGGESTIONS_FULL_REFRESH_CRON') or '').strip()
+        return ('SUGGESTIONS_FULL_REFRESH_CRON', expression) if expression else (None, None)
     day = (os.environ.get('SUGGESTIONS_FULL_REFRESH_DAY') or 'off').strip().lower()
     if day not in _SUGGESTIONS_WEEKDAYS:
         return None, None
