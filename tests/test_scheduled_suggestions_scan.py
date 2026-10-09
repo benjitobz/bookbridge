@@ -28,6 +28,7 @@ SCHEDULE_ENV = {
     "SUGGESTIONS_ENABLED": "true",
     "SUGGESTIONS_AUTO_MATCH_ENABLED": "false",
     "SUGGESTIONS_AUTO_SCAN_MINUTES": "0",
+    "SUGGESTIONS_FULL_REFRESH_ENABLED": "false",
     "SUGGESTIONS_FULL_REFRESH_CRON": "",
     "SUGGESTIONS_FULL_REFRESH_DAY": "off",
     "SUGGESTIONS_FULL_REFRESH_TIME": "04:00",
@@ -212,17 +213,27 @@ class TestCronSchedule(ScheduledScanTestCase):
                     web_server.parse_cron_expression(expression)
 
     def test_cron_runs_every_fire_once(self):
+        os.environ["SUGGESTIONS_FULL_REFRESH_ENABLED"] = "true"
         os.environ["SUGGESTIONS_FULL_REFRESH_CRON"] = "0 3 * * *"
         self.assertIsNone(web_server._suggestions_auto_scan_due(datetime(2026, 9, 21, 2, 59), {"last_full_fire": "2026-09-20T03:00:00"}))
         self.assertEqual("full", web_server._suggestions_auto_scan_due(datetime(2026, 9, 21, 3, 0), {"last_full_fire": "2026-09-20T03:00:00"}))
         self.assertIsNone(web_server._suggestions_auto_scan_due(datetime(2026, 9, 21, 9, 0), {"last_full_fire": "2026-09-21T03:00:00"}))
 
     def test_missed_fire_runs_up_to_a_day_late(self):
+        os.environ["SUGGESTIONS_FULL_REFRESH_ENABLED"] = "true"
         os.environ["SUGGESTIONS_FULL_REFRESH_CRON"] = "20 4 * * sun"
         self.assertEqual("full", web_server._suggestions_auto_scan_due(datetime(2026, 9, 28, 4, 19), {}))
         self.assertIsNone(web_server._suggestions_auto_scan_due(datetime(2026, 9, 28, 4, 21), {}))
 
+    def test_cron_is_off_until_enabled(self):
+        os.environ["SUGGESTIONS_FULL_REFRESH_CRON"] = "0 3 * * *"
+        self.assertIsNone(web_server._suggestions_auto_scan_due(datetime(2026, 9, 22, 3, 0), {}))
+        os.environ["SUGGESTIONS_FULL_REFRESH_ENABLED"] = "true"
+        os.environ["SUGGESTIONS_FULL_REFRESH_CRON"] = ""
+        self.assertIsNone(web_server._suggestions_auto_scan_due(datetime(2026, 9, 22, 3, 0), {}))
+
     def test_cron_overrides_the_weekly_day(self):
+        os.environ["SUGGESTIONS_FULL_REFRESH_ENABLED"] = "true"
         os.environ["SUGGESTIONS_FULL_REFRESH_CRON"] = "0 3 * * *"
         os.environ["SUGGESTIONS_FULL_REFRESH_DAY"] = "sunday"
         self.assertEqual("full", web_server._suggestions_auto_scan_due(datetime(2026, 9, 22, 3, 0), {}))
@@ -231,10 +242,12 @@ class TestCronSchedule(ScheduledScanTestCase):
         ))
 
     def test_a_legacy_refresh_already_run_that_day_is_not_repeated(self):
+        os.environ["SUGGESTIONS_FULL_REFRESH_ENABLED"] = "true"
         os.environ["SUGGESTIONS_FULL_REFRESH_CRON"] = "20 4 * * sun"
         self.assertIsNone(web_server._suggestions_auto_scan_due(datetime(2026, 9, 27, 9, 0), {"last_full_date": "2026-09-27"}))
 
     def test_invalid_cron_is_off_and_warns_once(self):
+        os.environ["SUGGESTIONS_FULL_REFRESH_ENABLED"] = "true"
         os.environ["SUGGESTIONS_FULL_REFRESH_CRON"] = "every sunday"
         with self.assertLogs("src.web_server", level="DEBUG") as logs:
             self.assertIsNone(web_server._suggestions_auto_scan_due(datetime(2026, 9, 27, 4, 20), {}))

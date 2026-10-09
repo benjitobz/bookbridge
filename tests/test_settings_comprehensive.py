@@ -83,6 +83,7 @@ class TestSettingsComprehensive(unittest.TestCase):
             'STORYGRAPH_ENABLED',
             'TELEGRAM_ENABLED',
             'SUGGESTIONS_ENABLED',
+            'SUGGESTIONS_FULL_REFRESH_ENABLED',
             'ABS_ONLY_SEARCH_IN_ABS_LIBRARY_ID',
             'REPROCESS_ON_CLEAR_IF_NO_ALIGNMENT',
             'INSTANT_SYNC_ENABLED',
@@ -254,11 +255,26 @@ class TestSettingsComprehensive(unittest.TestCase):
         with patch.dict(os.environ, legacy, clear=False):
             html = self._render_settings_template_source()
         self.assertIn('value="20 4 * * sun"', html)
+        self.assertIn('name="SUGGESTIONS_FULL_REFRESH_ENABLED"\n                            onchange="updateFullRefreshFields()"\n                            checked>', html.replace('\r', ''))
         self.assertIn('<input type="hidden" name="SUGGESTIONS_FULL_REFRESH_DAY" value="off">', html)
 
         with patch.dict(os.environ, {**legacy, 'SUGGESTIONS_FULL_REFRESH_CRON': '0 3 * * *'}, clear=False):
             html = self._render_settings_template_source()
         self.assertIn('value="0 3 * * *"', html)
+
+    def test_full_refresh_schedule_is_hidden_until_enabled(self):
+        with patch.dict(os.environ, {'SUGGESTIONS_FULL_REFRESH_ENABLED': 'false',
+                                     'SUGGESTIONS_FULL_REFRESH_CRON': '0 3 * * *',
+                                     'SUGGESTIONS_FULL_REFRESH_DAY': 'off'}, clear=False):
+            html = self._render_settings_template_source()
+        self.assertIn('<div class="form-group hidden"\n                        id="full_refresh_schedule_group">',
+                      html.replace('\r', ''))
+
+        with patch.dict(os.environ, {'SUGGESTIONS_FULL_REFRESH_ENABLED': 'true',
+                                     'SUGGESTIONS_FULL_REFRESH_CRON': '0 3 * * *'}, clear=False):
+            html = self._render_settings_template_source()
+        self.assertIn('<div class="form-group"\n                        id="full_refresh_schedule_group">',
+                      html.replace('\r', ''))
 
     @patch('src.web_server.restart_server')
     def test_saving_the_cron_retires_the_weekly_day(self, _mock_restart):
@@ -266,11 +282,16 @@ class TestSettingsComprehensive(unittest.TestCase):
         response = self.client.post('/settings', data={
             'SYNC_PERIOD_MINS': '5',
             'SUGGESTIONS_FULL_REFRESH_CRON': '0 3 * * *',
+            'SUGGESTIONS_FULL_REFRESH_ENABLED': 'on',
             'SUGGESTIONS_FULL_REFRESH_DAY': 'off',
         })
         self.assertEqual(response.status_code, 200)
         self.assertEqual('0 3 * * *', self.settings_store['SUGGESTIONS_FULL_REFRESH_CRON'])
         self.assertEqual('off', self.settings_store['SUGGESTIONS_FULL_REFRESH_DAY'])
+        self.assertEqual('true', self.settings_store['SUGGESTIONS_FULL_REFRESH_ENABLED'])
+
+        self.client.post('/settings', data={'SYNC_PERIOD_MINS': '5', 'SUGGESTIONS_FULL_REFRESH_CRON': '0 3 * * *'})
+        self.assertEqual('false', self.settings_store['SUGGESTIONS_FULL_REFRESH_ENABLED'])
 
     def test_settings_get_moves_account_credentials_to_per_user(self):
         html = self._render_settings_template_source()
