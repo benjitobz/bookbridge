@@ -1963,17 +1963,25 @@ def kosync_put_progress():
         if request_user_id is not None and not is_internal:
             kosync_doc.user_id = request_user_id
 
-    _database_service.save_kosync_document(kosync_doc)
+    # An internal write for this user must not land in a shared row another user
+    # owns: _respond_from_book_states serves owned rows as that owner's position.
+    prior_owner = kosync_doc.user_id if kosync_doc is not None else None
+    other_owned = request_user_id is not None and prior_owner not in (None, request_user_id)
+    foreign_row = is_internal and other_owned
+
+    if not foreign_row:
+        _database_service.save_kosync_document(kosync_doc)
     if not is_internal:
         _record_recent_external_kosync_put(doc_hash, device, device_id, percentage, now_ts, request_user_id)
-        # The observation was recorded before the furthest-wins gate, so that a report
-        # the guard rejects still counts toward proving a later rewind.
-        # Per-user device progress: the durable per-user record for unlinked docs
-        # and the furthest-wins / sibling-GET source (no-op for no-accounts installs).
-        _database_service.upsert_user_kosync_progress(
-            doc_hash, percentage, progress=progress, device=device,
-            device_id=device_id, timestamp=now, user_id=request_user_id,
-        )
+    # Every accepted write is recorded for the user who made it, the bridge's own
+    # pushes included: the shared row is one slot that changes owner whenever another
+    # user's device writes to it, so a position kept only there is lost the moment
+    # that happens. The per-user row is what a GET reads first. No-op for a
+    # no-accounts install, which keeps using the shared row.
+    _database_service.upsert_user_kosync_progress(
+        doc_hash, percentage, progress=progress, device=device,
+        device_id=device_id, timestamp=now, user_id=request_user_id,
+    )
 
     # Update linked book if exists
     linked_book = None
